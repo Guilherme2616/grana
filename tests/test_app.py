@@ -5,8 +5,8 @@ import pytest
 
 from app import create_app
 from app.extensions import db
-from app.models import Account, Category, CreditCard, Transaction, User
-from app.services.invoice_parser import parse_brl, parse_date
+from app.models import Account, CardCycle, Category, CreditCard, Investment, Transaction, User
+from app.services.invoice_parser import detect_due_date, parse_brl, parse_date
 
 
 class TestConfig:
@@ -59,4 +59,31 @@ def test_create_transaction(client, app):
 def test_money_and_date_parser():
     assert parse_brl("R$ 1.234,56") == Decimal("1234.56")
     assert parse_date("15/07", "2026-08") == date(2026, 7, 15)
+    assert detect_due_date("Data de vencimento: 28/08/2026", "2026-08") == date(2026, 8, 28)
 
+
+def test_monthly_card_cycle(client, app):
+    login(client)
+    with app.app_context():
+        card_id = CreditCard.query.first().id
+    response = client.post(f"/cartoes/{card_id}/configurar", data={
+        "action":"cycle", "reference_month":"2026-08",
+        "closing_date":"2026-08-20", "due_date":"2026-08-28",
+    }, follow_redirects=True)
+    assert response.status_code == 200
+    assert "Datas específicas dessa fatura salvas" in response.text
+    with app.app_context():
+        assert CardCycle.query.filter_by(reference_month="2026-08").count() == 1
+
+
+def test_create_investment(client, app):
+    login(client)
+    response = client.post("/investimentos", data={
+        "operation":"Compra", "category":"Renda variável", "subcategory":"FII",
+        "asset":"rzag11", "quantity":"10", "unit_value":"9,50",
+        "operation_date":"2026-08-20",
+    }, follow_redirects=True)
+    assert response.status_code == 200
+    assert "RZAG11" in response.text
+    with app.app_context():
+        assert Investment.query.first().total_value == Decimal("95.0000000000")

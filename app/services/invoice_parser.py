@@ -7,6 +7,15 @@ from pypdf import PdfReader
 
 DATE_PATTERN = re.compile(r"(?P<date>\d{2}/\d{2}(?:/\d{2,4})?)")
 AMOUNT_PATTERN = re.compile(r"(?P<amount>-?\s*(?:R\$\s*)?\d{1,3}(?:\.\d{3})*,\d{2})\s*$")
+EXPIRY_WORD_PATTERN = re.compile(r"\b(?:data\s+de\s+)?vencimento\b|\bvence\b", re.IGNORECASE)
+
+
+class PdfPasswordRequired(ValueError):
+    pass
+
+
+class PdfPasswordInvalid(ValueError):
+    pass
 
 
 def parse_brl(value):
@@ -32,8 +41,28 @@ def parse_date(value, reference_month):
     return date(year, month, day)
 
 
-def parse_invoice_pdf(stream, reference_month):
+def detect_due_date(text, reference_month):
+    for raw_line in text.splitlines():
+        line = " ".join(raw_line.split())
+        if not EXPIRY_WORD_PATTERN.search(line):
+            continue
+        date_match = DATE_PATTERN.search(line)
+        if date_match:
+            try:
+                return parse_date(date_match.group("date"), reference_month)
+            except ValueError:
+                continue
+    return None
+
+
+def parse_invoice_pdf(stream, reference_month, password=""):
     reader = PdfReader(stream)
+    if reader.is_encrypted:
+        if not password:
+            raise PdfPasswordRequired("Este PDF exige uma senha.")
+        if not reader.decrypt(password):
+            raise PdfPasswordInvalid("A senha informada não desbloqueou o PDF.")
+
     text = "\n".join(page.extract_text() or "" for page in reader.pages)
     items = []
     seen = set()
@@ -61,5 +90,4 @@ def parse_invoice_pdf(stream, reference_month):
         seen.add(identity)
         items.append({"purchase_date": purchase_date, "description": description[:180], "amount": amount})
 
-    return items
-
+    return {"items": items, "due_date": detect_due_date(text, reference_month)}

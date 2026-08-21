@@ -7,16 +7,24 @@ Aplicação Flask independente para organizar contas, movimentações, categoria
 - Login privado com senha criptografada;
 - Dashboard com saldo, entradas, saídas e últimas movimentações;
 - Cadastro de contas, categorias e cartões;
+- Edição das configurações padrão do cartão;
+- Fechamento e vencimento específicos para cada mês/fatura;
 - Lançamentos de receitas e despesas;
 - Exclusão de lançamentos;
 - Importação de fatura em PDF;
+- Leitura de PDFs protegidos por senha, sem armazenar a senha;
+- Sugestão automática do vencimento encontrado no PDF;
 - Revisão de cada compra antes da confirmação;
 - Conversão das compras confirmadas em lançamentos;
 - Banco SQLite, adequado para um único usuário;
 - Layout responsivo para computador e celular;
 - Proteção CSRF e limite de 10 MB por PDF.
+- Módulo de investimentos com compras, vendas, recebimentos e filtros;
+- Cálculos de valor investido e saldo disponível na corretora.
 
-> A leitura de PDFs usa reconhecimento por texto. Como cada banco monta a fatura de uma forma, a tela de revisão é obrigatória. PDFs protegidos, digitalizados como imagem ou com tabelas muito incomuns podem exigir um adaptador específico posteriormente.
+> A leitura usa o texto interno do PDF. Como cada banco monta a fatura de uma forma, a tela de revisão é obrigatória. PDFs digitalizados como imagem ou com tabelas muito incomuns podem exigir um adaptador específico posteriormente.
+
+PDFs protegidos por senha são aceitos. A senha existe apenas durante a requisição e não é gravada no banco, arquivo ou sessão. PDFs que sejam somente imagens ainda precisam de OCR.
 
 ## Rodar no computador
 
@@ -103,6 +111,20 @@ python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
 Clique em **Reload**. O sistema estará disponível no endereço mostrado pelo PythonAnywhere.
+
+## Atualizar uma instalação existente
+
+Depois de enviar uma nova versão ao GitHub, execute no console do PythonAnywhere:
+
+```bash
+cd ~/grana
+git pull origin main
+source venv/bin/activate
+pip install -r requirements.txt
+python upgrade.py
+```
+
+Depois volte à aba **Web** e clique em **Reload**. O `upgrade.py` cria somente as novas tabelas e categorias que estiverem faltando, preservando seus registros atuais.
 
 ## Backup
 

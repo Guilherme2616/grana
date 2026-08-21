@@ -49,6 +49,22 @@ class CreditCard(db.Model):
     active = db.Column(db.Boolean, default=True, nullable=False)
 
 
+class CardCycle(db.Model):
+    __table_args__ = (
+        db.UniqueConstraint("card_id", "reference_month", name="uq_card_cycle_month"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    card_id = db.Column(db.Integer, db.ForeignKey("credit_card.id"), nullable=False)
+    reference_month = db.Column(db.String(7), nullable=False)
+    closing_date = db.Column(db.Date, nullable=False)
+    due_date = db.Column(db.Date, nullable=False)
+    source = db.Column(db.String(20), default="manual", nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    card = db.relationship("CreditCard", backref=db.backref("cycles", cascade="all, delete-orphan"))
+
+
 class Transaction(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     description = db.Column(db.String(180), nullable=False)
@@ -91,3 +107,19 @@ class InvoiceItem(db.Model):
 
     category = db.relationship("Category")
 
+
+class Investment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    operation = db.Column(db.String(20), nullable=False)
+    category = db.Column(db.String(60), nullable=False)
+    subcategory = db.Column(db.String(60), default="")
+    asset = db.Column(db.String(30), nullable=False)
+    quantity = db.Column(db.Numeric(18, 8), nullable=False, default=Decimal("0"))
+    unit_value = db.Column(db.Numeric(14, 2), nullable=False, default=Decimal("0.00"))
+    operation_date = db.Column(db.Date, nullable=False, default=date.today)
+    notes = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    @property
+    def total_value(self):
+        return (self.quantity or Decimal("0")) * (self.unit_value or Decimal("0"))

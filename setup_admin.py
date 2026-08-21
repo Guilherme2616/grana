@@ -15,7 +15,7 @@ with app.app_context():
     user.set_password(password)
     db.session.add(user)
     if Category.query.count() == 0:
-        defaults = [("Alimentação", "expense", "#D98A61", "F"), ("Moradia", "expense", "#728C7A", "⌂"), ("Transporte", "expense", "#7A6C91", "T"), ("Lazer", "expense", "#D8B56A", "✦"), ("Salário", "income", "#5F8A68", "$")]
+        defaults = [("Alimentação", "expense", "#D98A61", "F"), ("Moradia", "expense", "#728C7A", "⌂"), ("Transporte", "expense", "#7A6C91", "T"), ("Lazer", "expense", "#D8B56A", "✦"), ("Investimentos", "expense", "#D8B56A", "↗"), ("Salário", "income", "#5F8A68", "$")]
         for name, kind, color, icon in defaults: db.session.add(Category(name=name, kind=kind, color=color, icon=icon))
     db.session.commit()
     print("Usuário criado e categorias iniciais adicionadas.")

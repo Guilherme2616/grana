@@ -6,6 +6,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/enhancements.css') }}">
 </head>
 <body>
 {% if current_user.is_authenticated %}
@@ -17,6 +18,7 @@
       <a class="nav-item {{ 'active' if request.endpoint == 'main.transactions' }}" href="{{ url_for('main.transactions') }}"><span>↕</span>Movimentações</a>
       <a class="nav-item {{ 'active' if request.endpoint in ['main.cards','main.import_invoice','main.review_invoice'] }}" href="{{ url_for('main.cards') }}"><span>▣</span>Cartões</a>
       <a class="nav-item {{ 'active' if request.endpoint == 'main.accounts' }}" href="{{ url_for('main.accounts') }}"><span>⌂</span>Contas</a>
+      <a class="nav-item {{ 'active' if request.endpoint in ['main.investments','main.edit_investment'] }}" href="{{ url_for('main.investments') }}"><span>↗</span>Investimentos</a>
       <a class="nav-item {{ 'active' if request.endpoint == 'main.categories' }}" href="{{ url_for('main.categories') }}"><span>◎</span>Categorias</a>
     </nav>
     <div class="sidebar-tip"><div class="coin-stack"><i>$</i><i>$</i><i>$</i></div><strong>Um passo por vez.</strong><span>Consistência vale mais do que perfeição.</span></div>
@@ -29,4 +31,3 @@
 </div>
 {% else %}{% block guest %}{% endblock %}{% endif %}
 </body></html>
-
