@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#173f35"><title>{% block title %}Grana{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+{% if current_user.is_authenticated %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <a class="brand" href="{{ url_for('main.dashboard') }}"><span class="brand-mark">$</span><span>grana.</span></a>
+    <nav><p class="nav-label">SEU DINHEIRO</p>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.dashboard' }}" href="{{ url_for('main.dashboard') }}"><span>◫</span>Visão geral</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.transactions' }}" href="{{ url_for('main.transactions') }}"><span>↕</span>Movimentações</a>
+      <a class="nav-item {{ 'active' if request.endpoint in ['main.cards','main.import_invoice','main.review_invoice'] }}" href="{{ url_for('main.cards') }}"><span>▣</span>Cartões</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.accounts' }}" href="{{ url_for('main.accounts') }}"><span>⌂</span>Contas</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.categories' }}" href="{{ url_for('main.categories') }}"><span>◎</span>Categorias</a>
+    </nav>
+    <div class="sidebar-tip"><div class="coin-stack"><i>$</i><i>$</i><i>$</i></div><strong>Um passo por vez.</strong><span>Consistência vale mais do que perfeição.</span></div>
+    <div class="profile"><div class="avatar">{{ current_user.username[:2]|upper }}</div><div><strong>{{ current_user.username }}</strong><span>Minha conta</span></div><form method="post" action="{{ url_for('main.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button title="Sair">↪</button></form></div>
+  </aside>
+  <section class="content">
+    {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-wrap">{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}{% endwith %}
+    {% block content %}{% endblock %}
+  </section>
+</div>
+{% else %}{% block guest %}{% endblock %}{% endif %}
+</body></html>
+

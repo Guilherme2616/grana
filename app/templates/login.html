@@ -1,0 +1,6 @@
+{% extends 'base.html' %}{% block title %}Entrar · Grana{% endblock %}
+{% block guest %}
+<main class="login-shell"><section class="login-art"><a class="brand"><span class="brand-mark">$</span><span>grana.</span></a><div class="login-copy"><span>DINHEIRO SEM COMPLICAÇÃO</span><h1>Seu dinheiro,<br><em>do seu jeito.</em></h1><p>Organize contas, cartões e faturas em um só lugar.</p></div><div class="big-coin">$</div></section>
+<section class="login-form"><form method="post" class="auth-card"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><span class="eyebrow">BEM-VINDO DE VOLTA</span><h2>Entre na sua conta</h2><p>Use o acesso configurado na instalação.</p>{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}<label>Usuário<input name="username" required autocomplete="username"></label><label>Senha<input type="password" name="password" required autocomplete="current-password"></label><label class="checkbox"><input type="checkbox" name="remember"> Manter conectado</label><button class="primary-button full">Entrar <span>→</span></button></form></section></main>
+{% endblock %}
+
