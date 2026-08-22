@@ -1,0 +1,49 @@
+{% extends 'base.html' %}
+{% block title %}Indicadores · Grana{% endblock %}
+{% block content %}
+<header class="page-head indicator-head">
+  <div><span class="eyebrow">CENTRAL DE DECISÃO</span><h1>Indicadores financeiros</h1><p>{{ month_name }} em detalhes: comportamento, patrimônio e pontos de atenção.</p></div>
+  <form method="get" class="period-picker"><label>Mês analisado<input type="month" name="month" value="{{ reference_month }}"></label><button class="secondary-button">Atualizar</button></form>
+</header>
+
+<section class="indicator-hero">
+  <article><span>PATRIMÔNIO TOTAL</span><strong>{{ patrimony|brl }}</strong><small>Caixa {{ cash|brl }} + investimentos {{ invested|brl }}</small></article>
+  <article><span>RESULTADO DO MÊS</span><strong class="{{ 'positive' if net >= 0 else 'negative' }}">{{ net|brl }}</strong><small>Entradas menos saídas</small></article>
+  <article><span>TAXA DE POUPANÇA</span><strong>{{ (savings_rate|string + '%') if savings_rate is not none else '—' }}</strong><small>Percentual preservado das entradas</small></article>
+  <article><span>PARCELAS FUTURAS</span><strong>{{ future_total|brl }}</strong><small>Próximos 12 meses provisionados</small></article>
+</section>
+
+<section class="indicator-metrics">
+  <article><span>Entradas</span><strong>{{ income|brl }}</strong><small>{% if income_change is not none %}{{ '%+.1f'|format(income_change) }}% ante o mês anterior{% else %}Sem base anterior{% endif %}</small></article>
+  <article><span>Despesas</span><strong>{{ expenses|brl }}</strong><small>{% if expense_change is not none %}{{ '%+.1f'|format(expense_change) }}% ante o mês anterior{% else %}Sem base anterior{% endif %}</small></article>
+  <article><span>Média diária</span><strong>{{ average_daily|brl }}</strong><small>Média dos dias considerados</small></article>
+  <article><span>Projeção do mês</span><strong>{{ projected_month|brl }}</strong><small>Ritmo atual até o último dia</small></article>
+</section>
+
+<section class="analytics-grid wide-first">
+  <article class="panel chart-panel"><div class="panel-head"><div><span>EVOLUÇÃO</span><h2>Entradas x despesas</h2></div><small>Últimos 6 meses</small></div><div class="chart-box large"><canvas id="trendChart"></canvas></div></article>
+  <article class="panel guidance-panel"><div class="panel-head"><div><span>NORTEAMENTO</span><h2>Leitura do seu mês</h2></div></div><div class="guidance-list">{% for item in guidance %}<div class="guidance {{ item.tone }}"><i></i><div><strong>{{ item.title }}</strong><p>{{ item.text }}</p></div></div>{% endfor %}</div><a class="secondary-button full" href="{{ url_for('main.future_invoices', month=reference_month) }}">Ver próximas faturas</a></article>
+</section>
+
+<section class="analytics-grid thirds">
+  <article class="panel chart-panel"><div class="panel-head"><div><span>DISTRIBUIÇÃO</span><h2>Por categoria</h2></div></div><div class="chart-box"><canvas id="categoryChart"></canvas></div></article>
+  <article class="panel chart-panel"><div class="panel-head"><div><span>CRÉDITO</span><h2>Por cartão</h2></div></div><div class="chart-box"><canvas id="cardChart"></canvas></div></article>
+  <article class="panel chart-panel"><div class="panel-head"><div><span>TIPO DE COMPRA</span><h2>Origem das despesas</h2></div></div><div class="chart-box"><canvas id="originChart"></canvas></div></article>
+</section>
+
+<section class="analytics-grid wide-first">
+  <article class="panel chart-panel"><div class="panel-head"><div><span>RITMO DO MÊS</span><h2>Gastos por dia</h2></div></div><div class="chart-box large"><canvas id="dailyChart"></canvas></div></article>
+  <article class="panel"><div class="panel-head"><div><span>MAIORES IMPACTOS</span><h2>Top despesas</h2></div></div><div class="rank-list">{% for item in top_expenses %}<div><span>{{ loop.index }}</span><p><strong>{{ item.description }}</strong><small>{{ item.category.name if item.category else 'Sem categoria' }} · {{ item.transaction_date.strftime('%d/%m') }}</small></p><b>{{ item.amount|brl }}</b></div>{% else %}<p class="empty">Nenhuma despesa no período.</p>{% endfor %}</div></article>
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script>
+const data={{ chart_data|tojson }};const money=v=>new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(v);const grid='rgba(23,63,53,.08)',ink='#173f35',gold='#d8b56a';
+Chart.defaults.font.family='DM Sans';Chart.defaults.color='#73807b';
+new Chart(document.getElementById('trendChart'),{type:'line',data:{labels:data.trend.map(x=>x.label),datasets:[{label:'Entradas',data:data.trend.map(x=>x.income),borderColor:'#4f8b5b',backgroundColor:'rgba(79,139,91,.12)',fill:true,tension:.35},{label:'Despesas',data:data.trend.map(x=>x.expenses),borderColor:'#b96b48',backgroundColor:'rgba(185,107,72,.09)',fill:true,tension:.35}]},options:{responsive:true,maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:c=>c.dataset.label+': '+money(c.raw)}}},scales:{x:{grid:{display:false}},y:{grid:{color:grid},ticks:{callback:v=>money(v)}}}}});
+new Chart(document.getElementById('categoryChart'),{type:'doughnut',data:{labels:data.categories.labels,datasets:[{data:data.categories.values,backgroundColor:data.categories.colors,borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'67%',plugins:{legend:{position:'bottom',labels:{boxWidth:9,usePointStyle:true}},tooltip:{callbacks:{label:c=>c.label+': '+money(c.raw)}}}}});
+new Chart(document.getElementById('cardChart'),{type:'bar',data:{labels:data.cards.labels,datasets:[{data:data.cards.values,backgroundColor:data.cards.colors,borderRadius:7}]},options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>money(c.raw)}}},scales:{x:{grid:{color:grid},ticks:{callback:v=>money(v)}},y:{grid:{display:false}}}}});
+new Chart(document.getElementById('originChart'),{type:'doughnut',data:{labels:data.origins.labels,datasets:[{data:data.origins.values,backgroundColor:[gold,ink],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{boxWidth:9,usePointStyle:true}},tooltip:{callbacks:{label:c=>c.label+': '+money(c.raw)}}}}});
+new Chart(document.getElementById('dailyChart'),{type:'bar',data:{labels:data.daily.labels,datasets:[{label:'Despesas',data:data.daily.values,backgroundColor:'#d8b56a',borderRadius:5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>money(c.raw)}}},scales:{x:{grid:{display:false}},y:{grid:{color:grid},ticks:{callback:v=>money(v)}}}}});
+</script>
+{% endblock %}

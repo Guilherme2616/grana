@@ -46,6 +46,8 @@ class CreditCard(db.Model):
     closing_day = db.Column(db.Integer, nullable=False)
     due_day = db.Column(db.Integer, nullable=False)
     color = db.Column(db.String(10), default="#173F35")
+    invoice_provider = db.Column(db.String(30), default="", nullable=False)
+    pdf_password_encrypted = db.Column(db.Text, nullable=True)
     active = db.Column(db.Boolean, default=True, nullable=False)
 
 
@@ -90,6 +92,10 @@ class Invoice(db.Model):
     total = db.Column(db.Numeric(12, 2), default=Decimal("0.00"))
     status = db.Column(db.String(20), default="draft", nullable=False)
     original_filename = db.Column(db.String(255), default="")
+    source = db.Column(db.String(30), default="generic", nullable=False)
+    credit_limit = db.Column(db.Numeric(12, 2), nullable=True)
+    cash_advance_total = db.Column(db.Numeric(12, 2), nullable=True)
+    drive_file_id = db.Column(db.String(255), unique=True, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     card = db.relationship("CreditCard", backref="invoices")
@@ -102,6 +108,8 @@ class InvoiceItem(db.Model):
     purchase_date = db.Column(db.Date, nullable=False)
     description = db.Column(db.String(180), nullable=False)
     amount = db.Column(db.Numeric(12, 2), nullable=False)
+    installment_current = db.Column(db.Integer, nullable=True)
+    installment_total = db.Column(db.Integer, nullable=True)
     selected = db.Column(db.Boolean, default=True, nullable=False)
     category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
 

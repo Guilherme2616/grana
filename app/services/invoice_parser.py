@@ -6,8 +6,35 @@ from pypdf import PdfReader
 
 
 DATE_PATTERN = re.compile(r"(?P<date>\d{2}/\d{2}(?:/\d{2,4})?)")
-AMOUNT_PATTERN = re.compile(r"(?P<amount>-?\s*(?:R\$\s*)?\d{1,3}(?:\.\d{3})*,\d{2})\s*$")
+AMOUNT_TEXT = r"\d{1,3}(?:\.\d{3})*,\d{2}"
+AMOUNT_PATTERN = re.compile(rf"(?P<amount>-?\s*(?:R\$\s*)?{AMOUNT_TEXT}-?)\s*$")
 EXPIRY_WORD_PATTERN = re.compile(r"\b(?:data\s+de\s+)?vencimento\b|\bvence\b", re.IGNORECASE)
+BB_SECTION_PATTERN = re.compile(r"lan[cç]amentos\s+nesta\s+fatura", re.IGNORECASE)
+BB_TOTAL_LINE_PATTERN = re.compile(r"^total(?:\s|$)", re.IGNORECASE)
+BB_COUNTRY_PATTERN = re.compile(r"\s+(?:[A-Z]{2}|\d{2})\s*$", re.IGNORECASE)
+MP_CARD_SECTION_PATTERN = re.compile(r"cart[aã]o\s+(?:visa|mastercard|elo|american\s+express)", re.IGNORECASE)
+INSTALLMENT_PATTERN = re.compile(r"\bparcela\s+(?P<current>\d+)\s+de\s+(?P<total>\d+)\b", re.IGNORECASE)
+SLASH_INSTALLMENT_PATTERN = re.compile(
+    r"\b(?:parc(?:ela)?[-\s]*)?(?P<current>\d{1,2})\s*/\s*(?P<total>\d{1,2})\b",
+    re.IGNORECASE,
+)
+INTER_SECTION_PATTERN = re.compile(r"despesas\s+da\s+fatura", re.IGNORECASE)
+INTER_TOTAL_PATTERN = re.compile(r"^total\s+cart[aã]o\b", re.IGNORECASE)
+INTER_AMOUNT_PATTERN = re.compile(rf"(?P<amount>R\$\s*{AMOUNT_TEXT})\s*$", re.IGNORECASE)
+INTER_DATE_PATTERN = re.compile(
+    r"^(?P<day>\d{1,2})\s+de\s+(?P<month>jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)\.?(?:\s+de)?\s+(?P<year>\d{4})(?:\s+|$)",
+    re.IGNORECASE,
+)
+PT_MONTHS = {
+    "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+    "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
+}
+ITAU_SECTION_PATTERN = re.compile(r"lan[cç]amentos\s*:\s*compras\s+e\s+saques", re.IGNORECASE)
+ITAU_END_PATTERN = re.compile(
+    r"^(?:total\s+dos\s+lan[cç]amentos\s+atuais|compras\s+parceladas\s*-?\s*pr[oó]ximas\s+faturas)",
+    re.IGNORECASE,
+)
+ITAU_ROW_DATE_PATTERN = re.compile(r"(?:^|\s{2,})(?P<date>\d{2}/\d{2})(?=\s+)")
 
 
 class PdfPasswordRequired(ValueError):
@@ -19,17 +46,19 @@ class PdfPasswordInvalid(ValueError):
 
 
 def parse_brl(value):
-    cleaned = value.replace("R$", "").replace(" ", "").replace(".", "").replace(",", ".")
+    cleaned = value.replace("R$", "").replace(" ", "")
+    negative = cleaned.startswith("-") or cleaned.endswith("-")
+    cleaned = cleaned.strip("-").replace(".", "").replace(",", ".")
     try:
-        return abs(Decimal(cleaned))
+        result = Decimal(cleaned)
+        return -result if negative else result
     except InvalidOperation as exc:
         raise ValueError(f"Valor inválido: {value}") from exc
 
 
 def parse_date(value, reference_month):
     month_year = datetime.strptime(reference_month, "%Y-%m")
-    formats = ["%d/%m/%Y", "%d/%m/%y"]
-    for fmt in formats:
+    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
         try:
             return datetime.strptime(value, fmt).date()
         except ValueError:
@@ -42,17 +71,437 @@ def parse_date(value, reference_month):
 
 
 def detect_due_date(text, reference_month):
-    for raw_line in text.splitlines():
-        line = " ".join(raw_line.split())
+    lines = [" ".join(raw_line.split()) for raw_line in text.splitlines()]
+    for index, line in enumerate(lines):
         if not EXPIRY_WORD_PATTERN.search(line):
             continue
-        date_match = DATE_PATTERN.search(line)
+        window = " ".join(lines[index:index + 3])
+        date_match = DATE_PATTERN.search(window)
         if date_match:
             try:
                 return parse_date(date_match.group("date"), reference_month)
             except ValueError:
                 continue
     return None
+
+
+def detect_bb_statement_total(text):
+    section_match = BB_SECTION_PATTERN.search(text)
+    cover = text[:section_match.start()] if section_match else text
+    patterns = (
+        re.compile(rf"\bValor\b\s*(?:\r?\n|\s)+R\$\s*(?P<amount>{AMOUNT_TEXT})", re.IGNORECASE),
+        re.compile(rf"^\s*Total\s+R\$\s*(?P<amount>{AMOUNT_TEXT})\s*$", re.IGNORECASE | re.MULTILINE),
+    )
+    for pattern in patterns:
+        match = pattern.search(cover)
+        if match:
+            return parse_brl(match.group("amount"))
+    return None
+
+
+def is_bb_smiles_invoice(text):
+    normalized = text.lower()
+    compact = re.sub(r"\s+", "", normalized)
+    return (
+        ("banco do brasil" in normalized or "bancodobrasil" in compact)
+        and "smiles" in normalized
+        and BB_SECTION_PATTERN.search(text) is not None
+    )
+
+
+def is_mercado_pago_invoice(text):
+    normalized = text.lower()
+    return "mercado pago" in normalized and "detalhes de consumo" in normalized
+
+
+def is_banco_inter_invoice(text):
+    normalized = text.lower()
+    return (
+        re.search(r"\binter\b", normalized) is not None
+        and "resumo da fatura" in normalized
+        and INTER_SECTION_PATTERN.search(text) is not None
+    )
+
+
+def is_itau_invoice(text):
+    normalized = text.lower()
+    return (
+        ("itaú" in normalized or re.search(r"\bitau\b", normalized) is not None)
+        and ITAU_SECTION_PATTERN.search(text) is not None
+        and "limite total de crédito" in normalized
+    )
+
+
+def _find_labeled_amount(text, label):
+    pattern = re.compile(
+        rf"{label}\s*(?::|[eé]\s*:)?\s*(?:\r?\n|\s)+R\$\s*(?P<amount>{AMOUNT_TEXT})",
+        re.IGNORECASE,
+    )
+    match = pattern.search(text)
+    return parse_brl(match.group("amount")) if match else None
+
+
+def parse_mercado_pago_summary(first_page_text, reference_month):
+    due_date = detect_due_date(first_page_text, reference_month)
+    total = _find_labeled_amount(first_page_text, r"total\s+a\s+pagar")
+    credit_limit = _find_labeled_amount(first_page_text, r"limite\s+total")
+    cash_advance_total = _find_labeled_amount(first_page_text, r"saque\s+total")
+
+    # No modo layout, os quatro títulos podem vir em uma linha e os valores na seguinte.
+    lines = [" ".join(line.split()) for line in first_page_text.splitlines()]
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        if "total a pagar" not in lowered or "limite total" not in lowered or "saque total" not in lowered:
+            continue
+        window = " ".join(lines[index:index + 4])
+        amounts = re.findall(rf"R\$\s*({AMOUNT_TEXT})", window)
+        if len(amounts) >= 3:
+            # Na extração em modo layout, os títulos ficam na mesma linha e os
+            # valores preservam a mesma ordem visual logo abaixo deles.
+            total = parse_brl(amounts[0])
+            credit_limit = parse_brl(amounts[1])
+            cash_advance_total = parse_brl(amounts[2])
+        break
+
+    return {
+        "due_date": due_date,
+        "statement_total": total,
+        "credit_limit": credit_limit,
+        "cash_advance_total": cash_advance_total,
+    }
+
+
+def parse_banco_inter_summary(first_page_text, second_page_text, reference_month):
+    """Lê os dados gerais; o total contábil é 'Despesas do mês'."""
+    return {
+        "due_date": detect_due_date(first_page_text, reference_month),
+        "statement_total": _find_labeled_amount(second_page_text, r"despesas\s+do\s+m[eê]s"),
+        "credit_limit": _find_labeled_amount(first_page_text, r"limite\s+de\s+cr[eé]dito\s+total"),
+        "cash_advance_total": None,
+    }
+
+
+def _find_itau_total(text, label):
+    pattern = re.compile(
+        rf"^\s*{label}\s+(?:R\$\s*)?(?P<amount>{AMOUNT_TEXT})\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    match = pattern.search(text)
+    return parse_brl(match.group("amount")) if match else None
+
+
+def parse_itau_summary(first_page_text, third_page_text, reference_month):
+    cover_total = _find_labeled_amount(
+        first_page_text,
+        r"(?:o\s+)?total\s+da\s+sua\s+fatura",
+    )
+    components = (
+        _find_itau_total(third_page_text, r"lan[cç]amentos\s+no\s+cart[aã]o"),
+        _find_itau_total(third_page_text, r"lan[cç]amentos\s+produtos\s+e\s+servi[cç]os"),
+        _find_itau_total(third_page_text, r"total\s+de\s+encargos\s+em\s+R\$"),
+    )
+    calculated_total = sum(components, Decimal("0")) if all(value is not None for value in components) else None
+    return {
+        "due_date": detect_due_date(first_page_text, reference_month),
+        "statement_total": calculated_total or cover_total,
+        "cover_total": cover_total,
+        "components": components,
+        "credit_limit": _find_labeled_amount(
+            first_page_text,
+            r"limite\s+total\s+de\s+cr[eé]dito",
+        ),
+        "cash_advance_total": None,
+    }
+
+
+def _append_item(
+    items,
+    seen,
+    raw_date,
+    raw_description,
+    raw_amount,
+    reference_month,
+    installment_current=None,
+    installment_total=None,
+):
+    description = " ".join(raw_description.split()).strip(" -–—·")
+    description = BB_COUNTRY_PATTERN.sub("", description).strip()
+    if len(description) < 2:
+        return
+    try:
+        purchase_date = parse_date(raw_date, reference_month)
+        amount = parse_brl(raw_amount)
+    except (ValueError, InvalidOperation):
+        return
+
+    # Pagamentos e créditos aparecem com sinal negativo no BB e não são compras.
+    if amount <= 0:
+        return
+    identity = (purchase_date.isoformat(), description.lower(), str(amount))
+    if identity in seen:
+        return
+    seen.add(identity)
+    items.append({
+        "purchase_date": purchase_date,
+        "description": description[:180],
+        "amount": amount,
+        "installment_current": installment_current,
+        "installment_total": installment_total,
+    })
+
+
+def parse_bb_smiles_text(text, reference_month):
+    section_match = BB_SECTION_PATTERN.search(text)
+    if not section_match:
+        return []
+
+    section = text[section_match.end():]
+    items = []
+    seen = set()
+    pending_date = None
+    pending_parts = []
+
+    for raw_line in section.splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            continue
+        if BB_TOTAL_LINE_PATTERN.match(line) and not line.lower().startswith("totalpass"):
+            break
+
+        date_match = re.match(r"^(?P<date>\d{2}/\d{2}(?:/\d{2,4})?)(?:\s+|$)(?P<rest>.*)$", line)
+        if date_match:
+            pending_date = date_match.group("date")
+            pending_parts = [date_match.group("rest")] if date_match.group("rest") else []
+        elif pending_date:
+            pending_parts.append(line)
+        else:
+            continue
+
+        combined = " ".join(pending_parts)
+        amount_match = AMOUNT_PATTERN.search(combined)
+        if amount_match:
+            description = combined[:amount_match.start()]
+            installment_match = SLASH_INSTALLMENT_PATTERN.search(description)
+            _append_item(
+                items,
+                seen,
+                pending_date,
+                description,
+                amount_match.group("amount"),
+                reference_month,
+                int(installment_match.group("current")) if installment_match else None,
+                int(installment_match.group("total")) if installment_match else None,
+            )
+            pending_date = None
+            pending_parts = []
+
+    return items
+
+
+def parse_mercado_pago_text(text, reference_month):
+    section_match = MP_CARD_SECTION_PATTERN.search(text)
+    if not section_match:
+        return []
+
+    section = text[section_match.end():]
+    items = []
+    seen = set()
+    pending_date = None
+    pending_parts = []
+
+    for raw_line in section.splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            continue
+        if BB_TOTAL_LINE_PATTERN.match(line) and not line.lower().startswith("totalpass"):
+            break
+
+        date_match = re.match(r"^(?P<date>\d{2}/\d{2}(?:/\d{2,4})?)(?:\s+|$)(?P<rest>.*)$", line)
+        if date_match:
+            pending_date = date_match.group("date")
+            pending_parts = [date_match.group("rest")] if date_match.group("rest") else []
+        elif pending_date:
+            pending_parts.append(line)
+        else:
+            continue
+
+        combined = " ".join(pending_parts)
+        amount_match = AMOUNT_PATTERN.search(combined)
+        if not amount_match:
+            continue
+
+        description_and_installment = combined[:amount_match.start()].strip()
+        installment_match = INSTALLMENT_PATTERN.search(description_and_installment)
+        installment_current = None
+        installment_total = None
+        if installment_match:
+            installment_current = int(installment_match.group("current"))
+            installment_total = int(installment_match.group("total"))
+            description = INSTALLMENT_PATTERN.sub("", description_and_installment).strip()
+        else:
+            description = description_and_installment
+
+        _append_item(
+            items,
+            seen,
+            pending_date,
+            description,
+            amount_match.group("amount"),
+            reference_month,
+            installment_current,
+            installment_total,
+        )
+        pending_date = None
+        pending_parts = []
+
+    return items
+
+
+def parse_banco_inter_text(text, reference_month):
+    section_match = INTER_SECTION_PATTERN.search(text)
+    if not section_match:
+        return []
+
+    section = text[section_match.end():]
+    items = []
+    seen = set()
+    pending_date = None
+    pending_parts = []
+
+    for raw_line in section.splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            continue
+        if INTER_TOTAL_PATTERN.match(line):
+            break
+
+        date_match = INTER_DATE_PATTERN.match(line)
+        if date_match:
+            purchase_date = date(
+                int(date_match.group("year")),
+                PT_MONTHS[date_match.group("month").lower()],
+                int(date_match.group("day")),
+            )
+            pending_date = purchase_date.strftime("%d/%m/%Y")
+            rest = line[date_match.end():].strip()
+            pending_parts = [rest] if rest else []
+        elif pending_date:
+            pending_parts.append(line)
+        else:
+            continue
+
+        combined = " ".join(pending_parts)
+        # Créditos/pagamentos do Inter aparecem com um '+' antes do valor.
+        if re.search(rf"\+\s*R\$\s*{AMOUNT_TEXT}\s*$", combined):
+            pending_date = None
+            pending_parts = []
+            continue
+        amount_match = INTER_AMOUNT_PATTERN.search(combined)
+        if not amount_match:
+            continue
+
+        description_and_installment = combined[:amount_match.start()].strip()
+        installment_match = INSTALLMENT_PATTERN.search(description_and_installment)
+        installment_current = None
+        installment_total = None
+        if installment_match:
+            installment_current = int(installment_match.group("current"))
+            installment_total = int(installment_match.group("total"))
+            description = INSTALLMENT_PATTERN.sub("", description_and_installment)
+            description = re.sub(r"\(\s*\)", "", description).strip()
+        else:
+            description = description_and_installment
+
+        _append_item(
+            items,
+            seen,
+            pending_date,
+            description,
+            amount_match.group("amount"),
+            reference_month,
+            installment_current,
+            installment_total,
+        )
+        pending_date = None
+        pending_parts = []
+
+    return items
+
+
+def parse_itau_text(text, reference_month):
+    section_match = ITAU_SECTION_PATTERN.search(text)
+    if not section_match:
+        return []
+
+    section = text[section_match.end():]
+    items = []
+    seen = set()
+
+    for raw_line in section.splitlines():
+        normalized_line = " ".join(raw_line.split()).strip()
+        if not normalized_line:
+            continue
+        if ITAU_END_PATTERN.match(normalized_line):
+            break
+
+        # A página 2 possui duas tabelas lado a lado. Os espaços preservados pelo
+        # modo layout permitem separar duas compras que estejam na mesma linha.
+        date_matches = list(ITAU_ROW_DATE_PATTERN.finditer(raw_line))
+        for index, date_match in enumerate(date_matches):
+            start = date_match.start("date")
+            end = date_matches[index + 1].start("date") if index + 1 < len(date_matches) else len(raw_line)
+            segment = " ".join(raw_line[start:end].split()).strip()
+            row_date = date_match.group("date")
+            remainder = segment[len(row_date):].strip()
+            amount_match = AMOUNT_PATTERN.search(remainder)
+            if not amount_match:
+                continue
+            description = remainder[:amount_match.start()].strip()
+            installment_match = SLASH_INSTALLMENT_PATTERN.search(description)
+            _append_item(
+                items,
+                seen,
+                row_date,
+                description,
+                amount_match.group("amount"),
+                reference_month,
+                int(installment_match.group("current")) if installment_match else None,
+                int(installment_match.group("total")) if installment_match else None,
+            )
+
+    return items
+
+
+def parse_generic_text(text, reference_month):
+    items = []
+    seen = set()
+    for raw_line in text.splitlines():
+        line = " ".join(raw_line.split())
+        date_match = DATE_PATTERN.search(line)
+        amount_match = AMOUNT_PATTERN.search(line)
+        if not date_match or not amount_match or date_match.start() > amount_match.start():
+            continue
+        description = line[date_match.end():amount_match.start()]
+        _append_item(
+            items,
+            seen,
+            date_match.group("date"),
+            description,
+            amount_match.group("amount"),
+            reference_month,
+        )
+    return items
+
+
+def extract_pdf_pages(reader):
+    pages = []
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text(extraction_mode="layout") or ""
+        except (TypeError, ValueError):
+            page_text = page.extract_text() or ""
+        pages.append(page_text)
+    return pages
 
 
 def parse_invoice_pdf(stream, reference_month, password=""):
@@ -63,31 +512,67 @@ def parse_invoice_pdf(stream, reference_month, password=""):
         if not reader.decrypt(password):
             raise PdfPasswordInvalid("A senha informada não desbloqueou o PDF.")
 
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    items = []
-    seen = set()
+    pages = extract_pdf_pages(reader)
+    text = "\n".join(pages)
+    due_date = detect_due_date(text, reference_month)
+    resolved_reference = due_date.strftime("%Y-%m") if due_date else reference_month
 
-    for raw_line in text.splitlines():
-        line = " ".join(raw_line.split())
-        date_match = DATE_PATTERN.search(line)
-        amount_match = AMOUNT_PATTERN.search(line)
-        if not date_match or not amount_match or date_match.start() > amount_match.start():
-            continue
+    if is_bb_smiles_invoice(text):
+        items = parse_bb_smiles_text(text, resolved_reference)
+        statement_total = detect_bb_statement_total(text)
+        adapter = "bb_smiles"
+        credit_limit = None
+        cash_advance_total = None
+    elif is_mercado_pago_invoice(text):
+        summary = parse_mercado_pago_summary(pages[0] if pages else text, reference_month)
+        due_date = summary["due_date"] or due_date
+        resolved_reference = due_date.strftime("%Y-%m") if due_date else reference_month
+        details_text = "\n".join(pages[1:]) if len(pages) > 1 else text
+        items = parse_mercado_pago_text(details_text, resolved_reference)
+        statement_total = summary["statement_total"]
+        credit_limit = summary["credit_limit"]
+        cash_advance_total = summary["cash_advance_total"]
+        adapter = "mercado_pago"
+    elif is_banco_inter_invoice(text):
+        first_page = pages[0] if pages else text
+        second_page = pages[1] if len(pages) > 1 else text
+        summary = parse_banco_inter_summary(first_page, second_page, reference_month)
+        due_date = summary["due_date"] or due_date
+        resolved_reference = due_date.strftime("%Y-%m") if due_date else reference_month
+        # Neste modelo, somente a página 3 contém as despesas analíticas atuais.
+        details_text = pages[2] if len(pages) > 2 else text
+        items = parse_banco_inter_text(details_text, resolved_reference)
+        statement_total = summary["statement_total"]
+        credit_limit = summary["credit_limit"]
+        cash_advance_total = None
+        adapter = "banco_inter"
+    elif is_itau_invoice(text):
+        first_page = pages[0] if pages else text
+        third_page = pages[2] if len(pages) > 2 else text
+        summary = parse_itau_summary(first_page, third_page, reference_month)
+        due_date = summary["due_date"] or due_date
+        resolved_reference = due_date.strftime("%Y-%m") if due_date else reference_month
+        # Os lançamentos atuais ocupam as páginas 2 e 3. Páginas posteriores
+        # descrevem parcelas futuras ou informações que não pertencem ao mês.
+        details_text = "\n".join(pages[1:3]) if len(pages) > 1 else text
+        items = parse_itau_text(details_text, resolved_reference)
+        statement_total = summary["statement_total"]
+        credit_limit = summary["credit_limit"]
+        cash_advance_total = None
+        adapter = "itau"
+    else:
+        items = parse_generic_text(text, resolved_reference)
+        statement_total = None
+        adapter = "generic"
+        credit_limit = None
+        cash_advance_total = None
 
-        description = line[date_match.end():amount_match.start()].strip(" -–—·")
-        if len(description) < 2:
-            continue
-
-        try:
-            purchase_date = parse_date(date_match.group("date"), reference_month)
-            amount = parse_brl(amount_match.group("amount"))
-        except (ValueError, InvalidOperation):
-            continue
-
-        identity = (purchase_date.isoformat(), description.lower(), str(amount))
-        if identity in seen:
-            continue
-        seen.add(identity)
-        items.append({"purchase_date": purchase_date, "description": description[:180], "amount": amount})
-
-    return {"items": items, "due_date": detect_due_date(text, reference_month)}
+    return {
+        "items": items,
+        "due_date": due_date,
+        "statement_total": statement_total,
+        "reference_month": resolved_reference,
+        "adapter": adapter,
+        "credit_limit": credit_limit,
+        "cash_advance_total": cash_advance_total,
+    }

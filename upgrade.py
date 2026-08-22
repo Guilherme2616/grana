@@ -3,11 +3,40 @@
 from app import create_app
 from app.extensions import db
 from app.models import Category
+from sqlalchemy import inspect, text
 
 
 app = create_app()
 with app.app_context():
     db.create_all()
+    inspector = inspect(db.engine)
+    migrations = {
+        "credit_card": {
+            "invoice_provider": "ALTER TABLE credit_card ADD COLUMN invoice_provider VARCHAR(30) DEFAULT '' NOT NULL",
+            "pdf_password_encrypted": "ALTER TABLE credit_card ADD COLUMN pdf_password_encrypted TEXT",
+        },
+        "invoice": {
+            "source": "ALTER TABLE invoice ADD COLUMN source VARCHAR(30) DEFAULT 'generic' NOT NULL",
+            "credit_limit": "ALTER TABLE invoice ADD COLUMN credit_limit NUMERIC(12, 2)",
+            "cash_advance_total": "ALTER TABLE invoice ADD COLUMN cash_advance_total NUMERIC(12, 2)",
+            "drive_file_id": "ALTER TABLE invoice ADD COLUMN drive_file_id VARCHAR(255)",
+        },
+        "invoice_item": {
+            "installment_current": "ALTER TABLE invoice_item ADD COLUMN installment_current INTEGER",
+            "installment_total": "ALTER TABLE invoice_item ADD COLUMN installment_total INTEGER",
+        },
+    }
+    for table_name, columns in migrations.items():
+        existing = {column["name"] for column in inspector.get_columns(table_name)}
+        for column_name, statement in columns.items():
+            if column_name not in existing:
+                db.session.execute(text(statement))
+    db.session.commit()
+    db.session.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_invoice_drive_file_id "
+        "ON invoice (drive_file_id) WHERE drive_file_id IS NOT NULL"
+    ))
+    db.session.commit()
     investment_category = Category.query.filter(
         db.func.lower(Category.name).in_(["investimento", "investimentos"])
     ).first()

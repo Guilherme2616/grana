@@ -6,13 +6,16 @@ Aplicação Flask independente para organizar contas, movimentações, categoria
 
 - Login privado com senha criptografada;
 - Dashboard com saldo, entradas, saídas e últimas movimentações;
+- Central de indicadores com filtros mensais, patrimônio, evolução, categorias, cartões, origem das compras e alertas;
 - Cadastro de contas, categorias e cartões;
 - Edição das configurações padrão do cartão;
 - Fechamento e vencimento específicos para cada mês/fatura;
 - Lançamentos de receitas e despesas;
 - Exclusão de lançamentos;
 - Importação de fatura em PDF;
-- Leitura de PDFs protegidos por senha, sem armazenar a senha;
+- Sincronização mensal em lote com uma pasta do Google Drive;
+- Leitores específicos para Banco do Brasil Smiles, Mercado Pago, Banco Inter e Itaú;
+- Leitura de PDFs protegidos por senha e armazenamento opcional criptografado por cartão;
 - Sugestão automática do vencimento encontrado no PDF;
 - Revisão de cada compra antes da confirmação;
 - Conversão das compras confirmadas em lançamentos;
@@ -21,10 +24,48 @@ Aplicação Flask independente para organizar contas, movimentações, categoria
 - Proteção CSRF e limite de 10 MB por PDF.
 - Módulo de investimentos com compras, vendas, recebimentos e filtros;
 - Cálculos de valor investido e saldo disponível na corretora.
+- Provisionamento de parcelas para as próximas 12 faturas, substituído pelo valor real quando a fatura já estiver confirmada;
+- Simulador de investimentos e poupança com aportes, cenários, inflação, IR regressivo, resultado líquido e evolução anual.
 
-> A leitura usa o texto interno do PDF. Como cada banco monta a fatura de uma forma, a tela de revisão é obrigatória. PDFs digitalizados como imagem ou com tabelas muito incomuns podem exigir um adaptador específico posteriormente.
+> A leitura usa o texto interno do PDF. No Banco do Brasil Smiles, considera somente “Lançamentos nesta fatura” até “Total”. No Mercado Pago, começa na tabela do cartão, ignora pagamentos de faturas, identifica parcelas e termina em “Total”, mesmo quando a tabela ocupa mais páginas. No Banco Inter, usa “Despesas do mês” como total e importa somente os gastos da página analítica, descartando pagamentos/créditos e as páginas posteriores. No Itaú, começa em “Lançamentos: compras e saques”, inclui produtos e serviços, encerra antes das próximas faturas e confere os subtotais com o total da capa. A tela de revisão continua obrigatória.
 
-PDFs protegidos por senha são aceitos. A senha existe apenas durante a requisição e não é gravada no banco, arquivo ou sessão. PDFs que sejam somente imagens ainda precisam de OCR.
+PDFs protegidos por senha são aceitos. Na importação manual, a senha é descartada depois da leitura. Para a sincronização do Drive, ela pode ser salva criptografada na configuração do cartão. A chave secreta do aplicativo precisa permanecer estável para que o sistema consiga descriptografá-la. PDFs que sejam somente imagens ainda precisam de OCR.
+
+## Sincronizar faturas pelo Google Drive
+
+Estrutura esperada dentro da pasta principal compartilhada:
+
+```text
+Faturas Grana/
+└── 2026/
+    └── AGOSTO/
+        ├── Banco do Brasil - Smiles.pdf
+        ├── Mercado Pago.pdf
+        ├── Banco Inter.pdf
+        └── Itaú.pdf
+```
+
+Também são aceitos nomes de mês como `08 - AGOSTO`. O aplicativo acessa a pasta somente para leitura e registra o ID de cada arquivo importado para impedir duplicações.
+
+### Configuração
+
+1. Crie um projeto no Google Cloud e habilite a **Google Drive API**;
+2. Crie uma **conta de serviço** e gere uma chave JSON;
+3. No Google Drive, compartilhe somente a pasta `Faturas Grana` como leitor com o e-mail da conta de serviço;
+4. No PythonAnywhere, crie `~/grana/instance` e envie a chave como `google-service-account.json`;
+5. Copie o ID da pasta `Faturas Grana` a partir do endereço exibido pelo Drive;
+6. Adicione ao arquivo WSGI, antes de importar a aplicação:
+
+```python
+os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"] = "/home/SEU_USUARIO/grana/instance/google-service-account.json"
+os.environ["GOOGLE_DRIVE_ROOT_FOLDER_ID"] = "ID_DA_PASTA_FATURAS_GRANA"
+```
+
+7. Recarregue o Web App;
+8. No Grana, abra cada cartão, escolha seu banco e salve a senha do PDF, caso exista;
+9. Em **Importar faturas**, selecione o mês e clique em **Sincronizar pasta**.
+
+As faturas são criadas como rascunho. Cada uma deve ser revisada e confirmada antes de virar lançamento.
 
 ## Rodar no computador
 
@@ -150,8 +191,8 @@ novo_financeiro/
 
 ## Próximas evoluções sugeridas
 
-- Ajustar o leitor ao formato exato das suas faturas reais;
-- Parcelas e recorrências;
+- Adicionar leitores específicos para outros bancos;
+- Recorrências;
 - Edição de lançamentos e cadastros;
 - Metas e planejamento mensal;
 - Gráficos com dados reais;

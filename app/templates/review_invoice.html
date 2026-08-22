@@ -1,2 +1,47 @@
-{% extends 'base.html' %}{% block title %}Revisar fatura · Grana{% endblock %}{% block content %}
-<header class="page-head"><div><span class="eyebrow">CONFIRA ANTES DE SALVAR</span><h1>Revisar fatura</h1><p>{{ invoice.card.name }} · {{ invoice.reference_month }} · {{ invoice.items|length }} compras encontradas</p></div><strong class="total-badge">{{ invoice.total|brl }}</strong></header><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="date_source" value="{{ suggestion.source }}"><section class="panel cycle-review"><div><span class="eyebrow">DATAS DESTA FATURA</span><h2>Fechamento e vencimento</h2><p>{% if suggestion.source == 'pdf' %}Encontramos o vencimento no PDF. Confira antes de salvar.{% else %}O PDF não informou o vencimento; usamos o padrão do cartão.{% endif %}</p></div><label>Data de fechamento<input type="date" name="closing_date" value="{{ suggestion.closing_date }}" required></label><label>Data de vencimento <span class="source-chip">{{ 'Encontrada no PDF' if suggestion.source == 'pdf' else 'Padrão do cartão' }}</span><input type="date" name="due_date" value="{{ suggestion.due_date }}" required></label></section><section class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>Importar</th><th>Data</th><th>Descrição</th><th>Categoria</th><th>Valor</th></tr></thead><tbody>{% for item in invoice.items %}<tr><td><input type="checkbox" name="selected" value="{{ item.id }}" checked></td><td>{{ item.purchase_date.strftime('%d/%m/%Y') }}</td><td><input name="description_{{ item.id }}" value="{{ item.description }}" required></td><td><select name="category_{{ item.id }}"><option value="">Sem categoria</option>{% for category in categories %}<option value="{{ category.id }}">{{ category.name }}</option>{% endfor %}</select></td><td><input class="amount-input" name="amount_{{ item.id }}" value="{{ '%.2f'|format(item.amount)|replace('.', ',') }}"></td></tr>{% endfor %}</tbody></table></div></section><div class="sticky-actions"><a href="{{ url_for('main.import_invoice') }}">Cancelar</a><button class="primary-button">Confirmar compras e datas →</button></div></form>{% endblock %}
+{% extends 'base.html' %}
+{% block title %}Revisar fatura · Grana{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <span class="eyebrow">CONFIRA ANTES DE SALVAR</span>
+    <h1>Revisar fatura</h1>
+    <p>
+      {{ invoice.card.name }} · {{ invoice.reference_month }} · {{ invoice.items|length }} compras encontradas
+      {% if suggestion.adapter == 'bb_smiles' %}<span class="source-chip">Leitor BB Smiles</span>{% endif %}
+      {% if suggestion.adapter == 'mercado_pago' %}<span class="source-chip">Leitor Mercado Pago</span>{% endif %}
+      {% if suggestion.adapter == 'banco_inter' %}<span class="source-chip">Leitor Banco Inter</span>{% endif %}
+      {% if suggestion.adapter == 'itau' %}<span class="source-chip">Leitor Itaú</span>{% endif %}
+    </p>
+  </div>
+  <div class="statement-summary">
+    <div class="statement-total"><small>{% if suggestion.adapter == 'banco_inter' %}DESPESAS DO MÊS{% else %}TOTAL A PAGAR{% endif %}</small><strong class="total-badge">{{ invoice.total|brl }}</strong></div>
+    {% if invoice.credit_limit is not none %}<div><small>LIMITE TOTAL</small><strong>{{ invoice.credit_limit|brl }}</strong></div>{% endif %}
+    {% if invoice.cash_advance_total is not none %}<div><small>SAQUE TOTAL</small><strong>{{ invoice.cash_advance_total|brl }}</strong></div>{% endif %}
+  </div>
+</header>
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="date_source" value="{{ suggestion.source }}">
+  <section class="panel cycle-review">
+    <div><span class="eyebrow">DATAS DESTA FATURA</span><h2>Fechamento e vencimento</h2><p>{% if suggestion.source == 'pdf' %}Encontramos o vencimento no PDF. Confira antes de salvar.{% else %}O PDF não informou o vencimento; usamos o padrão do cartão.{% endif %}</p></div>
+    <label>Data de fechamento<input type="date" name="closing_date" value="{{ suggestion.closing_date }}" required></label>
+    <label>Data de vencimento <span class="source-chip">{{ 'Encontrada no PDF' if suggestion.source == 'pdf' else 'Padrão do cartão' }}</span><input type="date" name="due_date" value="{{ suggestion.due_date }}" required></label>
+  </section>
+  <section class="panel table-panel"><div class="table-wrap"><table>
+    <thead><tr><th>Importar</th><th>Data</th><th>Descrição</th><th>Parcelas</th><th>Categoria</th><th>Valor</th></tr></thead>
+    <tbody>
+    {% for item in invoice.items %}
+      <tr>
+        <td><input type="checkbox" name="selected" value="{{ item.id }}" checked></td>
+        <td>{{ item.purchase_date.strftime('%d/%m/%Y') }}</td>
+        <td><input name="description_{{ item.id }}" value="{{ item.description }}" required></td>
+        <td>{% if item.installment_total %}<span class="installment-chip">{{ item.installment_current }}/{{ item.installment_total }}</span>{% else %}—{% endif %}</td>
+        <td><select name="category_{{ item.id }}"><option value="">Sem categoria</option>{% for category in categories %}<option value="{{ category.id }}">{{ category.name }}</option>{% endfor %}</select></td>
+        <td><input class="amount-input" name="amount_{{ item.id }}" value="{{ '%.2f'|format(item.amount)|replace('.', ',') }}"></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div></section>
+  <div class="sticky-actions"><a href="{{ url_for('main.import_invoice') }}">Cancelar</a><button class="primary-button">Confirmar compras e datas →</button></div>
+</form>
+{% endblock %}
