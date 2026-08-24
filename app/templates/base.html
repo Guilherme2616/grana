@@ -23,6 +23,13 @@
       <a class="nav-item {{ 'active' if request.endpoint == 'main.accounts' }}" href="{{ url_for('main.accounts') }}"><span>⌂</span>Contas</a>
       <a class="nav-item {{ 'active' if request.endpoint in ['main.investments','main.edit_investment','main.investment_simulator'] }}" href="{{ url_for('main.investments') }}"><span>↗</span>Investimentos</a>
       <a class="nav-item {{ 'active' if request.endpoint == 'main.categories' }}" href="{{ url_for('main.categories') }}"><span>◎</span>Categorias</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.recurring_transactions' }}" href="{{ url_for('main.recurring_transactions') }}"><span>↻</span>Recorrências</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.financial_calendar' }}" href="{{ url_for('main.financial_calendar') }}"><span>□</span>Calendário</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.goals' }}" href="{{ url_for('main.goals') }}"><span>◇</span>Metas</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.budget_planning' }}" href="{{ url_for('main.budget_planning') }}"><span>≋</span>Planejamento</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.alerts' }}" href="{{ url_for('main.alerts') }}"><span>!</span>Alertas</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.monthly_closing' }}" href="{{ url_for('main.monthly_closing') }}"><span>✓</span>Fechamento</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.data_tools' }}" href="{{ url_for('main.data_tools') }}"><span>⇄</span>Dados e backup</a>
     </nav>
     <div class="sidebar-tip"><div class="coin-stack"><i>$</i><i>$</i><i>$</i></div><strong>Um passo por vez.</strong><span>Consistência vale mais do que perfeição.</span></div>
     <div class="profile"><div class="avatar">{{ current_user.username[:2]|upper }}</div><div><strong>{{ current_user.username }}</strong><span>Minha conta</span></div><form method="post" action="{{ url_for('main.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button title="Sair">↪</button></form></div>

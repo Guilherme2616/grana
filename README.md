@@ -14,6 +14,18 @@ Aplicação Flask independente para organizar contas, movimentações, categoria
 - Orçamento mensal por categoria com alertas nos indicadores;
 - Regras automáticas por descrição, inclusive nas faturas importadas;
 - Divisão de uma compra entre várias categorias;
+- Filtros combináveis nos indicadores por categoria, subcategoria, cartão, banco, conta, tipo, comportamento, parcelamento e valor;
+- Pesquisa e filtros avançados nas movimentações;
+- Edição completa de lançamentos e proteção de meses fechados;
+- Contas recorrentes, assinaturas e geração automática de previsões;
+- Calendário financeiro de realizados, previstos e vencimentos;
+- Metas financeiras com acompanhamento de progresso e aportes;
+- Planejado versus realizado com projeção por categoria;
+- Central de alertas de orçamento, limite e vencimento;
+- Conciliação de faturas entre total oficial e compras reconhecidas;
+- Fechamento e reabertura mensal com fotografia dos resultados;
+- Importação de CSV e OFX, exportação CSV e backup JSON;
+- Carteira de investimentos com posição, preço médio, cotação manual, resultado e proventos;
 - Edição das configurações padrão do cartão;
 - Fechamento e vencimento específicos para cada mês/fatura;
 - Lançamentos de receitas e despesas;

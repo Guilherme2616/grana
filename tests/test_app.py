@@ -6,7 +6,7 @@ import pytest
 
 from app import create_app
 from app.extensions import db
-from app.models import Account, CardCycle, Category, CategoryRule, CreditCard, Investment, Invoice, InvoiceItem, Transaction, TransactionSplit, User
+from app.models import Account, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, Investment, Invoice, InvoiceItem, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
 from app.services.drive_sync import month_folder_matches, normalize_folder_name
 from app.services.financial_analytics import build_installment_projection, month_label, shift_month
 from app.services.invoice_parser import (
@@ -111,6 +111,35 @@ def test_split_transaction_requires_exact_total(client, app):
     with app.app_context():
         assert TransactionSplit.query.filter_by(transaction_id=ids[0]).count() == 2
         assert Transaction.query.get(ids[0]).category_id is None
+
+
+def test_indicator_filters_card_bank_and_subcategory(client, app):
+    login(client)
+    with app.app_context():
+        root=Category.query.first(); child=Category(name="Restaurante",kind="expense",parent_id=root.id)
+        card=CreditCard.query.first(); card.institution="Banco Teste"
+        db.session.add(child); db.session.flush()
+        db.session.add_all([Transaction(description="Jantar",amount=90,kind="expense",transaction_date=date.today(),category_id=child.id,card_id=card.id),Transaction(description="Outro",amount=200,kind="expense",transaction_date=date.today())]);db.session.commit(); ids=(child.id,card.id)
+    response=client.get(f"/indicadores?subcategory_id={ids[0]}&card_id={ids[1]}&institution=Banco+Teste")
+    assert response.status_code==200
+    assert "R$ 90,00" in response.text
+
+
+def test_recurring_calendar_goal_closing_and_export(client, app):
+    login(client)
+    today=date.today()
+    response=client.post("/recorrencias",data={"description":"Academia","amount":"100,00","kind":"expense","frequency":"monthly","day":today.day,"start_date":today.isoformat(),"auto_create":"on"},follow_redirects=True)
+    assert "Academia" in response.text
+    response=client.get(f"/calendario?month={today:%Y-%m}")
+    assert "Academia" in response.text
+    client.post("/metas",data={"name":"Reserva","target_amount":"1000,00","current_amount":"100,00"})
+    with app.app_context():
+        assert FinancialGoal.query.filter_by(name="Reserva").first().progress==Decimal("10.0")
+        assert RecurringTransaction.query.count()==1
+    client.post("/fechamento",data={"month":f"{today:%Y-%m}","action":"close"})
+    with app.app_context(): assert MonthlyClose.query.count()==1
+    export=client.get("/dados/exportar.csv")
+    assert export.status_code==200 and "text/csv" in export.content_type
 
 
 def test_money_and_date_parser():

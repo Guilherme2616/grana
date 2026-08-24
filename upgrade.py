@@ -14,6 +14,7 @@ with app.app_context():
         "credit_card": {
             "invoice_provider": "ALTER TABLE credit_card ADD COLUMN invoice_provider VARCHAR(30) DEFAULT '' NOT NULL",
             "pdf_password_encrypted": "ALTER TABLE credit_card ADD COLUMN pdf_password_encrypted TEXT",
+            "institution": "ALTER TABLE credit_card ADD COLUMN institution VARCHAR(100) DEFAULT '' NOT NULL",
         },
         "invoice": {
             "source": "ALTER TABLE invoice ADD COLUMN source VARCHAR(30) DEFAULT 'generic' NOT NULL",
@@ -38,6 +39,17 @@ with app.app_context():
             "protected": "ALTER TABLE category ADD COLUMN protected BOOLEAN DEFAULT 0 NOT NULL",
             "sort_order": "ALTER TABLE category ADD COLUMN sort_order INTEGER DEFAULT 0 NOT NULL",
         },
+        "transaction": {
+            "source": "ALTER TABLE \"transaction\" ADD COLUMN source VARCHAR(20) DEFAULT 'manual' NOT NULL",
+            "status": "ALTER TABLE \"transaction\" ADD COLUMN status VARCHAR(20) DEFAULT 'confirmed' NOT NULL",
+            "installment_current": "ALTER TABLE \"transaction\" ADD COLUMN installment_current INTEGER",
+            "installment_total": "ALTER TABLE \"transaction\" ADD COLUMN installment_total INTEGER",
+            "recurring_id": "ALTER TABLE \"transaction\" ADD COLUMN recurring_id INTEGER REFERENCES recurring_transaction(id)",
+        },
+        "investment": {
+            "fees": "ALTER TABLE investment ADD COLUMN fees NUMERIC(12, 2) DEFAULT 0 NOT NULL",
+            "benchmark": "ALTER TABLE investment ADD COLUMN benchmark VARCHAR(20) DEFAULT 'CDI' NOT NULL",
+        },
     }
     for table_name, columns in migrations.items():
         existing = {column["name"] for column in inspector.get_columns(table_name)}
@@ -54,6 +66,8 @@ with app.app_context():
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_invoice_drive_file_id "
         "ON invoice (drive_file_id) WHERE drive_file_id IS NOT NULL"
     ))
+    db.session.commit()
+    db.session.execute(text("UPDATE credit_card SET institution = CASE invoice_provider WHEN 'bb_smiles' THEN 'Banco do Brasil' WHEN 'mercado_pago' THEN 'Mercado Pago' WHEN 'banco_inter' THEN 'Banco Inter' WHEN 'itau' THEN 'Itaú' ELSE institution END WHERE institution IS NULL OR institution = ''"))
     db.session.commit()
     investment_category = Category.query.filter(
         db.func.lower(Category.name).in_(["investimento", "investimentos"])

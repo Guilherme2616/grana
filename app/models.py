@@ -72,6 +72,7 @@ class CreditCard(db.Model):
     invoice_provider = db.Column(db.String(30), default="", nullable=False)
     pdf_password_encrypted = db.Column(db.Text, nullable=True)
     active = db.Column(db.Boolean, default=True, nullable=False)
+    institution = db.Column(db.String(100), default="", nullable=False)
 
 
 class CardCycle(db.Model):
@@ -102,6 +103,11 @@ class Transaction(db.Model):
     card_id = db.Column(db.Integer, db.ForeignKey("credit_card.id"), nullable=True)
     invoice_item_id = db.Column(db.Integer, db.ForeignKey("invoice_item.id"), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    source = db.Column(db.String(20), default="manual", nullable=False)
+    status = db.Column(db.String(20), default="confirmed", nullable=False)
+    installment_current = db.Column(db.Integer, nullable=True)
+    installment_total = db.Column(db.Integer, nullable=True)
+    recurring_id = db.Column(db.Integer, db.ForeignKey("recurring_transaction.id"), nullable=True)
 
     account = db.relationship("Account", backref="transactions")
     category = db.relationship("Category", backref="transactions")
@@ -163,8 +169,66 @@ class Investment(db.Model):
     unit_value = db.Column(db.Numeric(14, 2), nullable=False, default=Decimal("0.00"))
     operation_date = db.Column(db.Date, nullable=False, default=date.today)
     notes = db.Column(db.Text, default="")
+    fees = db.Column(db.Numeric(12, 2), default=Decimal("0.00"), nullable=False)
+    benchmark = db.Column(db.String(20), default="CDI", nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     @property
     def total_value(self):
         return (self.quantity or Decimal("0")) * (self.unit_value or Decimal("0"))
+
+
+class AssetPrice(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    asset = db.Column(db.String(30), unique=True, nullable=False)
+    current_price = db.Column(db.Numeric(14, 2), nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class RecurringTransaction(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    description = db.Column(db.String(180), nullable=False)
+    amount = db.Column(db.Numeric(12, 2), nullable=False)
+    kind = db.Column(db.String(10), nullable=False, default="expense")
+    frequency = db.Column(db.String(20), nullable=False, default="monthly")
+    day = db.Column(db.Integer, nullable=False, default=1)
+    start_date = db.Column(db.Date, nullable=False, default=date.today)
+    end_date = db.Column(db.Date, nullable=True)
+    category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
+    account_id = db.Column(db.Integer, db.ForeignKey("account.id"), nullable=True)
+    card_id = db.Column(db.Integer, db.ForeignKey("credit_card.id"), nullable=True)
+    active = db.Column(db.Boolean, default=True, nullable=False)
+    auto_create = db.Column(db.Boolean, default=False, nullable=False)
+    notes = db.Column(db.Text, default="")
+
+    category = db.relationship("Category")
+    account = db.relationship("Account")
+    card = db.relationship("CreditCard")
+
+
+class FinancialGoal(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    target_amount = db.Column(db.Numeric(12, 2), nullable=False)
+    current_amount = db.Column(db.Numeric(12, 2), default=Decimal("0.00"), nullable=False)
+    target_date = db.Column(db.Date, nullable=True)
+    color = db.Column(db.String(10), default="#D8B56A")
+    active = db.Column(db.Boolean, default=True, nullable=False)
+    notes = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    @property
+    def progress(self):
+        if not self.target_amount:
+            return Decimal("0")
+        return min(Decimal("100"), (Decimal(self.current_amount) / Decimal(self.target_amount) * 100).quantize(Decimal("0.1")))
+
+
+class MonthlyClose(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    reference_month = db.Column(db.String(7), unique=True, nullable=False)
+    income = db.Column(db.Numeric(12, 2), nullable=False)
+    expenses = db.Column(db.Numeric(12, 2), nullable=False)
+    balance = db.Column(db.Numeric(12, 2), nullable=False)
+    snapshot_json = db.Column(db.Text, default="{}", nullable=False)
+    closed_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)

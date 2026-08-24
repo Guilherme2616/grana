@@ -1,14 +1,16 @@
 import calendar
+import csv
+import json
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from io import BytesIO
+from io import BytesIO, StringIO
 
-from flask import Blueprint, flash, redirect, render_template, request, session, url_for
+from flask import Blueprint, flash, redirect, render_template, request, send_file, session, url_for
 from flask_login import current_user, login_required, login_user, logout_user
 from sqlalchemy import extract, func
 
 from .extensions import db
-from .models import Account, CardCycle, Category, CategoryRule, CreditCard, Investment, Invoice, InvoiceItem, Transaction, TransactionSplit, User
+from .models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, Investment, Invoice, InvoiceItem, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
 from .services.drive_sync import (
     DriveAccessError,
     DriveConfigurationError,
@@ -45,6 +47,11 @@ def money(value):
 def form_decimal(name, default="0"):
     raw = request.form.get(name, default).strip().replace("R$", "").replace(".", "").replace(",", ".")
     return Decimal(raw)
+
+
+def month_is_closed(value):
+    reference = value.strftime("%Y-%m") if hasattr(value, "strftime") else str(value)[:7]
+    return MonthlyClose.query.filter_by(reference_month=reference).first() is not None
 
 
 def category_options(kind=None, active_only=True):
@@ -198,6 +205,40 @@ def percentage_change(current, previous):
     return ((current - previous) / previous * Decimal("100")).quantize(Decimal("0.1"))
 
 
+def transaction_filters():
+    return {key: request.args.get(key, "") for key in ("category_id", "subcategory_id", "card_id", "institution", "account_id", "kind", "necessity", "frequency", "installment", "min_value", "max_value", "q")}
+
+
+def filter_transactions(rows, filters):
+    selected_category = int(filters["subcategory_id"] or filters["category_id"] or 0)
+    root = db.session.get(Category, selected_category) if selected_category else None
+    allowed_category_ids = {root.id, *(child.id for child in root.children.all())} if root else None
+    result = []
+    for row in rows:
+        row_category_ids = {split.category_id for split in row.splits} or ({row.category_id} if row.category_id else set())
+        if allowed_category_ids and not row_category_ids.intersection(allowed_category_ids): continue
+        if filters["card_id"] and row.card_id != int(filters["card_id"]): continue
+        if filters["institution"] and (not row.card or row.card.institution != filters["institution"]): continue
+        if filters["account_id"] and row.account_id != int(filters["account_id"]): continue
+        if filters["kind"] and row.kind != filters["kind"]: continue
+        categories = [split.category for split in row.splits] or ([row.category] if row.category else [])
+        if filters["necessity"] and not any(c.necessity == filters["necessity"] for c in categories): continue
+        if filters["frequency"] and not any(c.frequency == filters["frequency"] for c in categories): continue
+        if filters["installment"] == "yes" and not row.installment_total: continue
+        if filters["installment"] == "no" and row.installment_total: continue
+        if filters["min_value"]:
+            try:
+                if Decimal(row.amount) < Decimal(filters["min_value"].replace(",", ".")): continue
+            except InvalidOperation: pass
+        if filters["max_value"]:
+            try:
+                if Decimal(row.amount) > Decimal(filters["max_value"].replace(",", ".")): continue
+            except InvalidOperation: pass
+        if filters["q"] and filters["q"].casefold() not in row.description.casefold(): continue
+        result.append(row)
+    return result
+
+
 def investment_position():
     items = Investment.query.all()
     buys = sum((item.total_value for item in items if item.operation == "Compra"), Decimal("0"))
@@ -300,10 +341,10 @@ def dashboard():
     today = date.today()
     base = Transaction.query.filter(extract("month", Transaction.transaction_date) == today.month, extract("year", Transaction.transaction_date) == today.year)
     income = money(base.filter_by(kind="income").with_entities(func.sum(Transaction.amount)).scalar())
-    expenses = money(base.filter_by(kind="expense").with_entities(func.sum(Transaction.amount)).scalar())
+    expenses = money(base.filter_by(kind="expense").with_entities(func.sum(Transaction.amount)).scalar()) - money(base.filter_by(kind="refund").with_entities(func.sum(Transaction.amount)).scalar())
     initial = money(db.session.query(func.sum(Account.initial_balance)).filter(Account.active.is_(True)).scalar())
     all_income = money(db.session.query(func.sum(Transaction.amount)).filter_by(kind="income").scalar())
-    all_expenses = money(db.session.query(func.sum(Transaction.amount)).filter_by(kind="expense").scalar())
+    all_expenses = money(db.session.query(func.sum(Transaction.amount)).filter_by(kind="expense").scalar()) - money(db.session.query(func.sum(Transaction.amount)).filter_by(kind="refund").scalar())
     balance = initial + all_income - all_expenses
     next_invoice = Invoice.query.filter_by(status="confirmed").order_by(Invoice.reference_month.desc()).first()
     transactions = Transaction.query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).limit(5).all()
@@ -322,12 +363,13 @@ def indicators():
 
     previous_month = shift_month(reference_month, -1)
     previous_start, previous_end = month_bounds(previous_month)
-    month_items = Transaction.query.filter(Transaction.transaction_date.between(start, end)).all()
-    previous_items = Transaction.query.filter(Transaction.transaction_date.between(previous_start, previous_end)).all()
+    filters = transaction_filters()
+    month_items = filter_transactions(Transaction.query.filter(Transaction.transaction_date.between(start, end)).all(), filters)
+    previous_items = filter_transactions(Transaction.query.filter(Transaction.transaction_date.between(previous_start, previous_end)).all(), filters)
     income = sum((Decimal(item.amount) for item in month_items if item.kind == "income"), Decimal("0"))
-    expenses = sum((Decimal(item.amount) for item in month_items if item.kind == "expense"), Decimal("0"))
+    expenses = sum((Decimal(item.amount) for item in month_items if item.kind == "expense"), Decimal("0")) - sum((Decimal(item.amount) for item in month_items if item.kind == "refund"), Decimal("0"))
     previous_income = sum((Decimal(item.amount) for item in previous_items if item.kind == "income"), Decimal("0"))
-    previous_expenses = sum((Decimal(item.amount) for item in previous_items if item.kind == "expense"), Decimal("0"))
+    previous_expenses = sum((Decimal(item.amount) for item in previous_items if item.kind == "expense"), Decimal("0")) - sum((Decimal(item.amount) for item in previous_items if item.kind == "refund"), Decimal("0"))
     net = income - expenses
     savings_rate = (net / income * Decimal("100")).quantize(Decimal("0.1")) if income else None
 
@@ -357,11 +399,11 @@ def indicators():
     for offset in range(-5, 1):
         month = shift_month(reference_month, offset)
         trend_start, trend_end = month_bounds(month)
-        rows = Transaction.query.filter(Transaction.transaction_date.between(trend_start, trend_end)).all()
+        rows = filter_transactions(Transaction.query.filter(Transaction.transaction_date.between(trend_start, trend_end)).all(), filters)
         trend.append({
             "label": month_label(month, short=True),
             "income": float(sum((Decimal(row.amount) for row in rows if row.kind == "income"), Decimal("0"))),
-            "expenses": float(sum((Decimal(row.amount) for row in rows if row.kind == "expense"), Decimal("0"))),
+            "expenses": float(sum((Decimal(row.amount) for row in rows if row.kind == "expense"), Decimal("0")) - sum((Decimal(row.amount) for row in rows if row.kind == "refund"), Decimal("0"))),
         })
 
     elapsed_days = end.day
@@ -410,7 +452,12 @@ def indicators():
         average_daily=average_daily, projected_month=projected_month, cash=cash, invested=invested,
         patrimony=patrimony, future_total=future_total, categories=categories, cards=cards,
         top_expenses=sorted(expense_items, key=lambda item: item.amount, reverse=True)[:8],
-        guidance=guidance, chart_data=chart_data,
+        guidance=guidance, chart_data=chart_data, filters=filters,
+        filter_categories=Category.query.filter_by(parent_id=None, active=True).order_by(Category.name).all(),
+        filter_subcategories=Category.query.filter(Category.parent_id.isnot(None), Category.active.is_(True)).order_by(Category.name).all(),
+        filter_cards=CreditCard.query.filter_by(active=True).order_by(CreditCard.name).all(),
+        filter_accounts=Account.query.filter_by(active=True).order_by(Account.name).all(),
+        institutions=[row[0] for row in db.session.query(CreditCard.institution).filter(CreditCard.institution != "").distinct().order_by(CreditCard.institution).all()],
     )
 
 
@@ -444,10 +491,13 @@ def future_invoices():
 def transactions():
     if request.method == "POST":
         try:
+            transaction_date = datetime.strptime(request.form["transaction_date"], "%Y-%m-%d").date()
+            if month_is_closed(transaction_date):
+                flash("Este mês está fechado. Reabra-o antes de adicionar lançamentos.", "warning"); return redirect(url_for("main.transactions"))
             category_id = request.form.get("category_id") or automatic_category(request.form["description"], request.form["kind"])
             transaction = Transaction(
                 description=request.form["description"].strip(), amount=form_decimal("amount"),
-                kind=request.form["kind"], transaction_date=datetime.strptime(request.form["transaction_date"], "%Y-%m-%d").date(),
+                kind=request.form["kind"], transaction_date=transaction_date,
                 account_id=request.form.get("account_id") or None, category_id=category_id,
                 card_id=request.form.get("card_id") or None, notes=request.form.get("notes", "").strip(),
             )
@@ -457,14 +507,48 @@ def transactions():
             return redirect(url_for("main.transactions"))
         except (ValueError, InvalidOperation):
             db.session.rollback(); flash("Confira a descrição, o valor e a data.", "danger")
-    items = Transaction.query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).all()
-    return render_template("transactions.html", transactions=items, accounts=Account.query.filter_by(active=True).all(), categories=category_options(), cards=CreditCard.query.filter_by(active=True).all(), today=date.today())
+    query = Transaction.query
+    start, end, q = request.args.get("start", ""), request.args.get("end", ""), request.args.get("q", "")
+    if start: query = query.filter(Transaction.transaction_date >= datetime.strptime(start, "%Y-%m-%d").date())
+    if end: query = query.filter(Transaction.transaction_date <= datetime.strptime(end, "%Y-%m-%d").date())
+    if q: query = query.filter(Transaction.description.ilike(f"%{q}%"))
+    raw_items = query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).all()
+    filters = transaction_filters()
+    items = filter_transactions(raw_items, filters)
+    return render_template("transactions.html", transactions=items, accounts=Account.query.filter_by(active=True).all(), categories=category_options(), cards=CreditCard.query.filter_by(active=True).all(), institutions=[row[0] for row in db.session.query(CreditCard.institution).filter(CreditCard.institution != "").distinct().all()], today=date.today(), filters={**filters, "start":start, "end":end})
+
+
+@main.route("/movimentacoes/<int:item_id>/editar", methods=["GET", "POST"])
+@login_required
+def edit_transaction(item_id):
+    item = db.get_or_404(Transaction, item_id)
+    if month_is_closed(item.transaction_date):
+        flash("Este mês está fechado. Reabra-o antes de editar.", "warning"); return redirect(url_for("main.transactions"))
+    if request.method == "POST":
+        try:
+            item.description = request.form["description"].strip()
+            item.amount = form_decimal("amount")
+            item.kind = request.form["kind"]
+            item.transaction_date = datetime.strptime(request.form["transaction_date"], "%Y-%m-%d").date()
+            item.category_id = request.form.get("category_id") or None
+            item.account_id = request.form.get("account_id") or None
+            item.card_id = request.form.get("card_id") or None
+            item.notes = request.form.get("notes", "").strip()
+            item.installment_current = int(request.form["installment_current"]) if request.form.get("installment_current") else None
+            item.installment_total = int(request.form["installment_total"]) if request.form.get("installment_total") else None
+            if not item.description or item.amount <= 0: raise ValueError
+            db.session.commit(); flash("Lançamento atualizado.", "success"); return redirect(url_for("main.transactions"))
+        except (ValueError, InvalidOperation):
+            db.session.rollback(); flash("Confira os dados do lançamento.", "danger")
+    return render_template("edit_transaction.html", item=item, categories=category_options(), accounts=Account.query.filter_by(active=True).all(), cards=CreditCard.query.filter_by(active=True).all())
 
 
 @main.post("/movimentacoes/<int:item_id>/excluir")
 @login_required
 def delete_transaction(item_id):
-    item = db.get_or_404(Transaction, item_id); db.session.delete(item); db.session.commit(); flash("Lançamento excluído.", "success")
+    item = db.get_or_404(Transaction, item_id)
+    if month_is_closed(item.transaction_date): flash("Este mês está fechado. Reabra-o antes de excluir.", "warning"); return redirect(url_for("main.transactions"))
+    db.session.delete(item); db.session.commit(); flash("Lançamento excluído.", "success")
     return redirect(url_for("main.transactions"))
 
 
@@ -601,7 +685,7 @@ def delete_category_rule(rule_id):
 def cards():
     if request.method == "POST":
         try:
-            card = CreditCard(name=request.form["name"].strip(), last_digits=request.form.get("last_digits", "")[-4:], credit_limit=form_decimal("credit_limit"), closing_day=int(request.form["closing_day"]), due_day=int(request.form["due_day"]), color=request.form.get("color", "#173F35"))
+            card = CreditCard(name=request.form["name"].strip(), institution=request.form.get("institution", "").strip(), last_digits=request.form.get("last_digits", "")[-4:], credit_limit=form_decimal("credit_limit"), closing_day=int(request.form["closing_day"]), due_day=int(request.form["due_day"]), color=request.form.get("color", "#173F35"))
             if not 1 <= card.closing_day <= 31 or not 1 <= card.due_day <= 31: raise ValueError
             update_card_pdf_settings(card)
             db.session.add(card); db.session.commit(); flash("Cartão adicionado.", "success"); return redirect(url_for("main.cards"))
@@ -619,6 +703,7 @@ def configure_card(card_id):
         try:
             if action == "card":
                 card.name = request.form["name"].strip()
+                card.institution = request.form.get("institution", "").strip()
                 card.last_digits = request.form.get("last_digits", "")[-4:]
                 card.credit_limit = form_decimal("credit_limit")
                 card.closing_day = int(request.form["closing_day"])
@@ -687,7 +772,10 @@ def invoices():
     query = Invoice.query
     if status in {"draft", "confirmed"}:
         query = query.filter_by(status=status)
-    invoice_rows = query.order_by(Invoice.created_at.desc()).all()
+    invoice_rows = []
+    for invoice in query.order_by(Invoice.created_at.desc()).all():
+        recognized = sum((Decimal(item.amount) for item in invoice.items if item.selected), Decimal("0"))
+        invoice_rows.append({"invoice":invoice,"recognized":recognized,"difference":Decimal(invoice.total or 0)-recognized})
     pending_count = Invoice.query.filter_by(status="draft").count()
     return render_template(
         "invoices.html",
@@ -788,7 +876,7 @@ def review_invoice(invoice_id):
             item.category_id = request.form.get(f"category_{item.id}") or automatic_category(item.description)
             if item.selected:
                 total += item.amount
-                db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id))
+                db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id, source="invoice", installment_current=item.installment_current, installment_total=item.installment_total))
         source = "pdf" if request.form.get("date_source") == "pdf" else "manual"
         upsert_card_cycle(invoice.card, invoice.reference_month, closing_date, due_date, source)
         official_total = invoice.statement_total
@@ -813,6 +901,201 @@ def discard_invoice(invoice_id):
     db.session.commit()
     flash(f"{filename} foi descartada e já pode ser importada novamente.", "success")
     return redirect(url_for("main.invoices", status="draft"))
+
+
+@main.route("/recorrencias", methods=["GET", "POST"])
+@login_required
+def recurring_transactions():
+    if request.method == "POST":
+        try:
+            item = RecurringTransaction(description=request.form["description"].strip(), amount=form_decimal("amount"), kind=request.form.get("kind", "expense"), frequency=request.form.get("frequency", "monthly"), day=int(request.form.get("day", 1)), start_date=datetime.strptime(request.form["start_date"], "%Y-%m-%d").date(), end_date=datetime.strptime(request.form["end_date"], "%Y-%m-%d").date() if request.form.get("end_date") else None, category_id=request.form.get("category_id") or None, account_id=request.form.get("account_id") or None, card_id=request.form.get("card_id") or None, auto_create=bool(request.form.get("auto_create")), notes=request.form.get("notes", "").strip())
+            if not item.description or item.amount <= 0 or not 1 <= item.day <= 31: raise ValueError
+            db.session.add(item); db.session.commit(); flash("Recorrência cadastrada.", "success"); return redirect(url_for("main.recurring_transactions"))
+        except (ValueError, InvalidOperation):
+            db.session.rollback(); flash("Confira os dados da recorrência.", "danger")
+    return render_template("recurring.html", items=RecurringTransaction.query.order_by(RecurringTransaction.active.desc(), RecurringTransaction.description).all(), categories=category_options(), accounts=Account.query.filter_by(active=True).all(), cards=CreditCard.query.filter_by(active=True).all(), today=date.today())
+
+
+@main.post("/recorrencias/<int:item_id>/alternar")
+@login_required
+def toggle_recurring(item_id):
+    item = db.get_or_404(RecurringTransaction, item_id); item.active = not item.active; db.session.commit(); flash("Recorrência atualizada.", "success")
+    return redirect(url_for("main.recurring_transactions"))
+
+
+def materialize_recurring(reference_month):
+    start, end = month_bounds(reference_month)
+    for recurring in RecurringTransaction.query.filter_by(active=True, auto_create=True).all():
+        event_date = safe_date(start.year, start.month, recurring.day)
+        if event_date < recurring.start_date or (recurring.end_date and event_date > recurring.end_date): continue
+        if not Transaction.query.filter_by(recurring_id=recurring.id, transaction_date=event_date).first():
+            db.session.add(Transaction(description=recurring.description, amount=recurring.amount, kind=recurring.kind, transaction_date=event_date, category_id=recurring.category_id, account_id=recurring.account_id, card_id=recurring.card_id, recurring_id=recurring.id, source="recurring", status="planned" if event_date > date.today() else "confirmed", notes=recurring.notes))
+    db.session.commit()
+
+
+@main.get("/calendario")
+@login_required
+def financial_calendar():
+    reference_month = request.args.get("month") or date.today().strftime("%Y-%m")
+    start, end = month_bounds(reference_month)
+    materialize_recurring(reference_month)
+    events = []
+    for row in Transaction.query.filter(Transaction.transaction_date.between(start, end)).all():
+        events.append({"date":row.transaction_date,"title":row.description,"amount":row.amount,"tone":"income" if row.kind == "income" else "expense","detail":"Previsto" if row.status == "planned" else "Realizado"})
+    for cycle in CardCycle.query.filter(CardCycle.due_date.between(start, end)).all():
+        events.append({"date":cycle.due_date,"title":f"Fatura {cycle.card.name}","amount":None,"tone":"card","detail":"Vencimento"})
+    return render_template("calendar.html", reference_month=reference_month, month_name=month_label(reference_month), events=sorted(events, key=lambda row: row["date"]))
+
+
+@main.route("/metas", methods=["GET", "POST"])
+@login_required
+def goals():
+    if request.method == "POST":
+        try:
+            goal = FinancialGoal(name=request.form["name"].strip(), target_amount=form_decimal("target_amount"), current_amount=form_decimal("current_amount"), target_date=datetime.strptime(request.form["target_date"], "%Y-%m-%d").date() if request.form.get("target_date") else None, color=request.form.get("color", "#D8B56A"), notes=request.form.get("notes", "").strip())
+            if not goal.name or goal.target_amount <= 0: raise ValueError
+            db.session.add(goal); db.session.commit(); flash("Meta criada.", "success"); return redirect(url_for("main.goals"))
+        except (ValueError, InvalidOperation):
+            db.session.rollback(); flash("Confira os dados da meta.", "danger")
+    return render_template("goals.html", goals=FinancialGoal.query.order_by(FinancialGoal.active.desc(), FinancialGoal.target_date).all())
+
+
+@main.post("/metas/<int:goal_id>/aportar")
+@login_required
+def contribute_goal(goal_id):
+    goal = db.get_or_404(FinancialGoal, goal_id)
+    try:
+        goal.current_amount = Decimal(goal.current_amount) + form_decimal("amount"); db.session.commit(); flash("Aporte registrado na meta.", "success")
+    except InvalidOperation:
+        db.session.rollback(); flash("Informe um aporte válido.", "danger")
+    return redirect(url_for("main.goals"))
+
+
+@main.get("/alertas")
+@login_required
+def alerts():
+    today = date.today(); alerts_list = []
+    for row in Transaction.query.filter(Transaction.status == "planned", Transaction.transaction_date <= today).all():
+        alerts_list.append({"tone":"danger","title":"Conta prevista vencida","text":f"{row.description} • {brl(row.amount)} • {row.transaction_date.strftime('%d/%m')}"})
+    for card in CreditCard.query.filter_by(active=True).all():
+        used = money(db.session.query(func.sum(Transaction.amount)).filter_by(card_id=card.id, kind="expense").scalar())
+        if card.credit_limit and used / Decimal(card.credit_limit) >= Decimal("0.80"):
+            alerts_list.append({"tone":"warning","title":f"Limite do {card.name}","text":f"Utilização acumulada de {(used/Decimal(card.credit_limit)*100).quantize(Decimal('1'))}%."})
+    for category in Category.query.filter(Category.monthly_budget.isnot(None), Category.active.is_(True)).all():
+        start, end = month_bounds(today.strftime("%Y-%m")); spent = money(db.session.query(func.sum(Transaction.amount)).filter(Transaction.category_id == category.id, Transaction.kind == "expense", Transaction.transaction_date.between(start,end)).scalar())
+        if category.monthly_budget and spent >= Decimal(category.monthly_budget)*Decimal("0.9"):
+            alerts_list.append({"tone":"warning","title":f"Orçamento: {category.full_name}","text":f"{brl(spent)} de {brl(category.monthly_budget)} utilizados."})
+    duplicates=db.session.query(Transaction.description,Transaction.amount,Transaction.transaction_date,func.count(Transaction.id)).group_by(Transaction.description,Transaction.amount,Transaction.transaction_date).having(func.count(Transaction.id)>1).all()
+    for description,amount,transaction_date,count in duplicates[:5]:
+        alerts_list.append({"tone":"warning","title":"Possível lançamento duplicado","text":f"{description} aparece {count} vezes em {transaction_date.strftime('%d/%m')} com valor {brl(amount)}."})
+    return render_template("alerts.html", alerts=alerts_list)
+
+
+@main.get("/planejamento")
+@login_required
+def budget_planning():
+    reference_month=request.args.get("month") or date.today().strftime("%Y-%m"); start,end=month_bounds(reference_month)
+    elapsed=date.today().day if reference_month==date.today().strftime("%Y-%m") else end.day
+    rows=[]
+    for category in Category.query.filter(Category.active.is_(True),Category.monthly_budget.isnot(None)).order_by(Category.name).all():
+        direct=money(db.session.query(func.sum(Transaction.amount)).filter(Transaction.category_id==category.id,Transaction.kind=="expense",Transaction.transaction_date.between(start,end)).scalar())
+        split=money(db.session.query(func.sum(TransactionSplit.amount)).join(Transaction).filter(TransactionSplit.category_id==category.id,Transaction.transaction_date.between(start,end)).scalar())
+        spent=direct+split; budget=Decimal(category.monthly_budget); projected=(spent/max(elapsed,1))*end.day; percent=(spent/budget*100).quantize(Decimal("1")) if budget else Decimal("0")
+        rows.append({"category":category,"budget":budget,"spent":spent,"remaining":budget-spent,"projected":projected,"percent":percent})
+    return render_template("budget_planning.html",reference_month=reference_month,rows=rows,total_budget=sum((x["budget"] for x in rows),Decimal("0")),total_spent=sum((x["spent"] for x in rows),Decimal("0")))
+
+
+@main.route("/fechamento", methods=["GET", "POST"])
+@login_required
+def monthly_closing():
+    reference_month = request.values.get("month") or date.today().strftime("%Y-%m")
+    start, end = month_bounds(reference_month); rows = Transaction.query.filter(Transaction.transaction_date.between(start,end), Transaction.status == "confirmed").all()
+    income = sum((Decimal(row.amount) for row in rows if row.kind == "income"), Decimal("0")); expenses = sum((Decimal(row.amount) for row in rows if row.kind == "expense"), Decimal("0"))
+    closed = MonthlyClose.query.filter_by(reference_month=reference_month).first()
+    if request.method == "POST" and request.form.get("action") == "close" and not closed:
+        snapshot = {"transactions":len(rows),"top":[row.description for row in sorted(rows,key=lambda x:x.amount,reverse=True)[:5]]}
+        db.session.add(MonthlyClose(reference_month=reference_month,income=income,expenses=expenses,balance=income-expenses,snapshot_json=json.dumps(snapshot,ensure_ascii=False))); db.session.commit(); flash("Mês fechado e protegido.", "success"); return redirect(url_for("main.monthly_closing",month=reference_month))
+    if request.method == "POST" and request.form.get("action") == "reopen" and closed:
+        db.session.delete(closed); db.session.commit(); flash("Mês reaberto.", "success"); return redirect(url_for("main.monthly_closing",month=reference_month))
+    return render_template("monthly_closing.html", reference_month=reference_month, closed=closed, income=income, expenses=expenses, net=income-expenses, rows=rows)
+
+
+@main.get("/dados/exportar.csv")
+@login_required
+def export_transactions():
+    month = request.args.get("month"); query = Transaction.query
+    if month:
+        start,end=month_bounds(month); query=query.filter(Transaction.transaction_date.between(start,end))
+    rows=filter_transactions(query.order_by(Transaction.transaction_date).all(), transaction_filters())
+    stream=StringIO(); writer=csv.writer(stream,delimiter=";"); writer.writerow(["Data","Descrição","Tipo","Valor","Categoria","Conta","Cartão","Banco","Origem"])
+    for row in rows: writer.writerow([row.transaction_date.strftime("%d/%m/%Y"),row.description,row.kind,str(row.amount).replace(".",","),row.category.full_name if row.category else "",row.account.name if row.account else "",row.card.name if row.card else "",row.card.institution if row.card else "",row.source])
+    data=BytesIO(stream.getvalue().encode("utf-8-sig")); return send_file(data,mimetype="text/csv",as_attachment=True,download_name=f"grana-{month or 'movimentacoes'}.csv")
+
+
+def build_simple_pdf(lines):
+    escaped=[str(line).encode("latin-1","replace").decode("latin-1").replace("\\","\\\\").replace("(","\\(").replace(")","\\)") for line in lines]
+    content="BT /F1 11 Tf 45 800 Td 14 TL "+" ".join(f"({line}) Tj T*" for line in escaped)+" ET"
+    objects=["<< /Type /Catalog /Pages 2 0 R >>","<< /Type /Pages /Kids [3 0 R] /Count 1 >>","<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",f"<< /Length {len(content.encode('latin-1'))} >>\nstream\n{content}\nendstream","<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    pdf=bytearray(b"%PDF-1.4\n"); offsets=[]
+    for index,obj in enumerate(objects,1): offsets.append(len(pdf)); pdf.extend(f"{index} 0 obj\n{obj}\nendobj\n".encode("latin-1"))
+    xref=len(pdf); pdf.extend(f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n".encode())
+    for offset in offsets: pdf.extend(f"{offset:010d} 00000 n \n".encode())
+    pdf.extend(f"trailer << /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode()); return bytes(pdf)
+
+
+@main.get("/dados/relatorio.pdf")
+@login_required
+def monthly_pdf_report():
+    reference_month=request.args.get("month") or date.today().strftime("%Y-%m"); start,end=month_bounds(reference_month)
+    rows=Transaction.query.filter(Transaction.transaction_date.between(start,end)).order_by(Transaction.transaction_date).all()
+    income=sum((Decimal(x.amount) for x in rows if x.kind=="income"),Decimal("0")); expenses=sum((Decimal(x.amount) for x in rows if x.kind=="expense"),Decimal("0"))
+    lines=["GRANA - RELATORIO MENSAL",month_label(reference_month),"",f"Entradas: {brl(income)}",f"Despesas: {brl(expenses)}",f"Resultado: {brl(income-expenses)}","","MOVIMENTACOES"]
+    lines.extend(f"{x.transaction_date:%d/%m} | {x.description[:48]} | {brl(x.amount)}" for x in rows[:42])
+    return send_file(BytesIO(build_simple_pdf(lines)),mimetype="application/pdf",as_attachment=True,download_name=f"grana-relatorio-{reference_month}.pdf")
+
+
+@main.get("/dados/backup.json")
+@login_required
+def backup_data():
+    payload={"generated_at":datetime.utcnow().isoformat(),"accounts":[{"name":x.name,"institution":x.institution,"initial_balance":str(x.initial_balance)} for x in Account.query.all()],"categories":[{"name":x.name,"kind":x.kind,"parent":x.parent.name if x.parent else None} for x in Category.query.all()],"transactions":[{"description":x.description,"amount":str(x.amount),"kind":x.kind,"date":x.transaction_date.isoformat(),"category":x.category.full_name if x.category else None} for x in Transaction.query.all()]}
+    data=BytesIO(json.dumps(payload,ensure_ascii=False,indent=2).encode("utf-8")); return send_file(data,mimetype="application/json",as_attachment=True,download_name=f"grana-backup-{date.today().isoformat()}.json")
+
+
+@main.route("/dados", methods=["GET", "POST"])
+@login_required
+def data_tools():
+    if request.method == "POST":
+        file = request.files.get("file")
+        if not file or not file.filename:
+            flash("Selecione um arquivo CSV ou OFX.", "danger"); return redirect(url_for("main.data_tools"))
+        try:
+            content = file.read().decode("utf-8-sig", errors="ignore")
+            imported = 0
+            if file.filename.lower().endswith(".csv"):
+                dialect = csv.Sniffer().sniff(content[:2048], delimiters=";,\t,")
+                for row in csv.DictReader(StringIO(content), dialect=dialect):
+                    lowered = {str(key).strip().casefold(): value for key,value in row.items()}
+                    description = (lowered.get("descrição") or lowered.get("descricao") or lowered.get("description") or "Importado").strip()
+                    raw_amount = (lowered.get("valor") or lowered.get("amount") or "0").replace("R$","").strip()
+                    amount = Decimal(raw_amount.replace(".","").replace(",","."))
+                    raw_date = lowered.get("data") or lowered.get("date")
+                    parsed_date = datetime.strptime(raw_date, "%d/%m/%Y").date() if "/" in raw_date else datetime.strptime(raw_date, "%Y-%m-%d").date()
+                    kind = lowered.get("tipo") or lowered.get("kind") or ("expense" if amount < 0 else "income")
+                    db.session.add(Transaction(description=description,amount=abs(amount),kind="expense" if kind in {"expense","saída","saida"} else "income",transaction_date=parsed_date,category_id=automatic_category(description,"expense" if amount < 0 else "income"),source="csv")); imported += 1
+            elif file.filename.lower().endswith(".ofx"):
+                import re
+                for block in re.findall(r"<STMTTRN>(.*?)(?:</STMTTRN>|(?=<STMTTRN>))",content,re.S|re.I):
+                    def tag(name):
+                        match=re.search(rf"<{name}>([^<\r\n]+)",block,re.I); return match.group(1).strip() if match else ""
+                    amount=Decimal(tag("TRNAMT") or "0"); raw_date=tag("DTPOSTED")[:8]
+                    description=tag("MEMO") or tag("NAME") or "Importado OFX"
+                    db.session.add(Transaction(description=description,amount=abs(amount),kind="expense" if amount < 0 else "income",transaction_date=datetime.strptime(raw_date,"%Y%m%d").date(),category_id=automatic_category(description,"expense" if amount < 0 else "income"),source="ofx")); imported += 1
+            else:
+                raise ValueError
+            db.session.commit(); flash(f"{imported} lançamentos importados. Revise as categorias.", "success")
+        except Exception:
+            db.session.rollback(); flash("Não foi possível interpretar o arquivo. Confira colunas, datas e valores.", "danger")
+    return render_template("data_tools.html")
 
 
 @main.post("/faturas/<int:invoice_id>/reprocessar")
@@ -865,7 +1148,7 @@ def investments():
             item = Investment(
                 operation=request.form["operation"], category=request.form["category"].strip(),
                 subcategory=request.form.get("subcategory", "").strip(), asset=request.form["asset"].strip().upper(),
-                quantity=form_decimal("quantity"), unit_value=form_decimal("unit_value"),
+                quantity=form_decimal("quantity"), unit_value=form_decimal("unit_value"), fees=form_decimal("fees") if request.form.get("fees") else Decimal("0"), benchmark=request.form.get("benchmark", "CDI"),
                 operation_date=datetime.strptime(request.form["operation_date"], "%Y-%m-%d").date(),
                 notes=request.form.get("notes", "").strip(),
             )
@@ -900,9 +1183,34 @@ def investments():
     total_transferred = money(db.session.query(func.sum(Transaction.amount)).filter(Transaction.kind == "expense", Transaction.category_id.in_(category_ids)).scalar()) if category_ids else Decimal("0")
     invested_value = total_buys - total_sales
     broker_balance = total_transferred - total_buys + total_sales + total_receipts
+    positions = []
+    for asset in sorted({row.asset for row in all_items if row.operation in {"Compra","Venda"}}):
+        asset_rows = [row for row in all_items if row.asset == asset]
+        buys = [row for row in asset_rows if row.operation == "Compra"]
+        sales = [row for row in asset_rows if row.operation == "Venda"]
+        quantity = sum((Decimal(row.quantity) for row in buys),Decimal("0"))-sum((Decimal(row.quantity) for row in sales),Decimal("0"))
+        cost = sum((row.total_value + Decimal(row.fees or 0) for row in buys),Decimal("0"))
+        average = cost / sum((Decimal(row.quantity) for row in buys),Decimal("0")) if buys else Decimal("0")
+        quote = AssetPrice.query.filter_by(asset=asset).first(); current_price = Decimal(quote.current_price) if quote else average
+        current_value = quantity * current_price; invested_cost = quantity * average; pnl = current_value-invested_cost
+        receipts = sum((row.total_value for row in asset_rows if row.operation == "Recebimento"),Decimal("0"))
+        positions.append({"asset":asset,"quantity":quantity,"average":average,"current_price":current_price,"current_value":current_value,"pnl":pnl,"return_pct":(pnl/invested_cost*100).quantize(Decimal("0.1")) if invested_cost else None,"receipts":receipts,"updated_at":quote.updated_at if quote else None})
     categories = [row[0] for row in db.session.query(Investment.category).distinct().order_by(Investment.category).all()]
     subcategories = [row[0] for row in db.session.query(Investment.subcategory).filter(Investment.subcategory != "").distinct().order_by(Investment.subcategory).all()]
-    return render_template("investments.html", investments=items, today=date.today(), total_transferred=total_transferred, total_buys=total_buys, total_sales=total_sales, total_receipts=total_receipts, invested_value=invested_value, broker_balance=broker_balance, categories=categories, subcategories=subcategories, filters={"start":start,"end":end,"category":category,"subcategory":subcategory})
+    return render_template("investments.html", investments=items, positions=positions, today=date.today(), total_transferred=total_transferred, total_buys=total_buys, total_sales=total_sales, total_receipts=total_receipts, invested_value=invested_value, broker_balance=broker_balance, categories=categories, subcategories=subcategories, filters={"start":start,"end":end,"category":category,"subcategory":subcategory})
+
+
+@main.post("/investimentos/cotacao")
+@login_required
+def update_asset_price():
+    try:
+        asset=request.form["asset"].strip().upper(); price=form_decimal("current_price")
+        if not asset or price<=0: raise ValueError
+        quote=AssetPrice.query.filter_by(asset=asset).first() or AssetPrice(asset=asset,current_price=price)
+        quote.current_price=price; db.session.add(quote); db.session.commit(); flash("Cotação atualizada.", "success")
+    except (ValueError,InvalidOperation):
+        db.session.rollback(); flash("Informe ativo e cotação válidos.", "danger")
+    return redirect(url_for("main.investments"))
 
 
 @main.get("/investimentos/simulador")
@@ -923,6 +1231,8 @@ def edit_investment(item_id):
             item.asset = request.form["asset"].strip().upper()
             item.quantity = form_decimal("quantity")
             item.unit_value = form_decimal("unit_value")
+            item.fees = form_decimal("fees") if request.form.get("fees") else Decimal("0")
+            item.benchmark = request.form.get("benchmark", "CDI")
             item.operation_date = datetime.strptime(request.form["operation_date"], "%Y-%m-%d").date()
             item.notes = request.form.get("notes", "").strip()
             if item.operation not in {"Compra", "Venda", "Recebimento"} or not item.category or not item.asset or item.quantity <= 0 or item.unit_value < 0:
