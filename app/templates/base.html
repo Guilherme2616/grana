@@ -1,43 +1,24 @@
-<!doctype html>
-<html lang="pt-BR">
-<head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#173f35"><title>{% block title %}Grana{% endblock %}</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/enhancements.css') }}">
-</head>
-<body>
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#173f35"><title>{% block title %}Grana{% endblock %}</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet"><link rel="stylesheet" href="{{ url_for('static',filename='css/style.css') }}"><link rel="stylesheet" href="{{ url_for('static',filename='css/enhancements.css') }}"></head><body>
 {% if current_user.is_authenticated %}
-<div class="app-shell">
-  <aside class="sidebar">
-    <a class="brand" href="{{ url_for('main.dashboard') }}"><span class="brand-mark">$</span><span>grana.</span></a>
-    <nav><p class="nav-label">SEU DINHEIRO</p>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.dashboard' }}" href="{{ url_for('main.dashboard') }}"><span>◫</span>Visão geral</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.indicators' }}" href="{{ url_for('main.indicators') }}"><span>◒</span>Indicadores</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.transactions' }}" href="{{ url_for('main.transactions') }}"><span>↕</span>Movimentações</a>
-      <a class="nav-item {{ 'active' if request.endpoint in ['main.cards','main.import_invoice','main.review_invoice'] }}" href="{{ url_for('main.cards') }}"><span>▣</span>Cartões</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.invoices' }}" href="{{ url_for('main.invoices') }}"><span>▤</span>Faturas</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.future_invoices' }}" href="{{ url_for('main.future_invoices') }}"><span>◷</span>Próximas faturas</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.accounts' }}" href="{{ url_for('main.accounts') }}"><span>⌂</span>Contas</a>
-      <a class="nav-item {{ 'active' if request.endpoint in ['main.investments','main.edit_investment','main.investment_simulator'] }}" href="{{ url_for('main.investments') }}"><span>↗</span>Investimentos</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.categories' }}" href="{{ url_for('main.categories') }}"><span>◎</span>Categorias</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.recurring_transactions' }}" href="{{ url_for('main.recurring_transactions') }}"><span>↻</span>Recorrências</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.financial_calendar' }}" href="{{ url_for('main.financial_calendar') }}"><span>□</span>Calendário</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.goals' }}" href="{{ url_for('main.goals') }}"><span>◇</span>Metas</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.budget_planning' }}" href="{{ url_for('main.budget_planning') }}"><span>≋</span>Planejamento</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.alerts' }}" href="{{ url_for('main.alerts') }}"><span>!</span>Alertas</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.monthly_closing' }}" href="{{ url_for('main.monthly_closing') }}"><span>✓</span>Fechamento</a>
-      <a class="nav-item {{ 'active' if request.endpoint == 'main.data_tools' }}" href="{{ url_for('main.data_tools') }}"><span>⇄</span>Dados e backup</a>
-    </nav>
-    <div class="sidebar-tip"><div class="coin-stack"><i>$</i><i>$</i><i>$</i></div><strong>Um passo por vez.</strong><span>Consistência vale mais do que perfeição.</span></div>
-    <div class="profile"><div class="avatar">{{ current_user.username[:2]|upper }}</div><div><strong>{{ current_user.username }}</strong><span>Minha conta</span></div><form method="post" action="{{ url_for('main.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button title="Sair">↪</button></form></div>
-  </aside>
-  <section class="content">
-    {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-wrap">{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}{% endwith %}
-    {% block content %}{% endblock %}
-  </section>
-</div>
-{% else %}{% block guest %}{% endblock %}{% endif %}
-</body></html>
+{% set endpoint=request.endpoint or '' %}
+{% set money_active=endpoint in ['main.transactions','main.edit_transaction','main.split_transaction','main.accounts','main.categories','main.edit_category','main.recurring_transactions','main.financial_calendar'] %}
+{% set cards_active=endpoint in ['main.cards','main.configure_card','main.invoices','main.import_invoice','main.review_invoice','main.future_invoices'] %}
+{% set planning_active=endpoint in ['main.indicators','main.budget_planning','main.goals','main.alerts','main.monthly_closing'] %}
+{% set assets_active=endpoint in ['main.investments','main.edit_investment','main.investment_simulator'] %}
+{% set settings_active=endpoint in ['main.data_tools'] %}
+<button class="mobile-menu-button" id="mobileMenuButton" aria-label="Abrir menu" aria-expanded="false">☰</button><div class="sidebar-overlay" id="sidebarOverlay"></div>
+<div class="app-shell"><aside class="sidebar" id="sidebar"><header class="sidebar-head"><a class="brand" href="{{ url_for('main.dashboard') }}"><span class="brand-mark">$</span><span class="brand-name">grana.</span></a><button class="sidebar-collapse" id="sidebarCollapse" title="Recolher menu" aria-label="Recolher menu">‹</button></header>
+<nav class="grouped-nav">
+  <a class="nav-main {{ 'active' if endpoint=='main.dashboard' }}" href="{{ url_for('main.dashboard') }}"><span class="nav-icon">⌂</span><span class="nav-text">Início</span></a>
+  <section class="nav-group {{ 'open' if money_active }}" data-group="money"><button class="nav-group-button" type="button" aria-expanded="{{ 'true' if money_active else 'false' }}"><span class="nav-icon">↕</span><span class="nav-text">Meu dinheiro</span><i>›</i></button><div class="nav-submenu"><a class="{{ 'active' if endpoint in ['main.transactions','main.edit_transaction','main.split_transaction'] }}" href="{{ url_for('main.transactions') }}">Movimentações</a><a class="{{ 'active' if endpoint=='main.accounts' }}" href="{{ url_for('main.accounts') }}">Contas</a><a class="{{ 'active' if endpoint in ['main.categories','main.edit_category'] }}" href="{{ url_for('main.categories') }}">Categorias</a><a class="{{ 'active' if endpoint=='main.recurring_transactions' }}" href="{{ url_for('main.recurring_transactions') }}">Recorrências</a><a class="{{ 'active' if endpoint=='main.financial_calendar' }}" href="{{ url_for('main.financial_calendar') }}">Calendário</a></div></section>
+  <section class="nav-group {{ 'open' if cards_active }}" data-group="cards"><button class="nav-group-button" type="button" aria-expanded="{{ 'true' if cards_active else 'false' }}"><span class="nav-icon">▣</span><span class="nav-text">Cartões e faturas</span>{% if nav_pending_invoices %}<b class="nav-badge">{{ nav_pending_invoices }}</b>{% endif %}<i>›</i></button><div class="nav-submenu"><a class="{{ 'active' if endpoint in ['main.cards','main.configure_card'] }}" href="{{ url_for('main.cards') }}">Cartões</a><a class="{{ 'active' if endpoint=='main.invoices' }}" href="{{ url_for('main.invoices') }}">Faturas{% if nav_pending_invoices %}<b>{{ nav_pending_invoices }}</b>{% endif %}</a><a class="{{ 'active' if endpoint=='main.future_invoices' }}" href="{{ url_for('main.future_invoices') }}">Próximas faturas</a><a class="{{ 'active' if endpoint in ['main.import_invoice','main.review_invoice'] }}" href="{{ url_for('main.import_invoice') }}">Importar faturas</a></div></section>
+  <section class="nav-group {{ 'open' if planning_active }}" data-group="planning"><button class="nav-group-button" type="button" aria-expanded="{{ 'true' if planning_active else 'false' }}"><span class="nav-icon">◒</span><span class="nav-text">Planejamento</span>{% if nav_alerts %}<b class="nav-badge alert">{{ nav_alerts }}</b>{% endif %}<i>›</i></button><div class="nav-submenu"><a class="{{ 'active' if endpoint=='main.indicators' }}" href="{{ url_for('main.indicators') }}">Indicadores</a><a class="{{ 'active' if endpoint=='main.budget_planning' }}" href="{{ url_for('main.budget_planning') }}">Planejamento mensal</a><a class="{{ 'active' if endpoint=='main.goals' }}" href="{{ url_for('main.goals') }}">Metas</a><a class="{{ 'active' if endpoint=='main.alerts' }}" href="{{ url_for('main.alerts') }}">Alertas{% if nav_alerts %}<b>{{ nav_alerts }}</b>{% endif %}</a><a class="{{ 'active' if endpoint=='main.monthly_closing' }}" href="{{ url_for('main.monthly_closing') }}">Fechamento mensal</a></div></section>
+  <section class="nav-group {{ 'open' if assets_active }}" data-group="assets"><button class="nav-group-button" type="button" aria-expanded="{{ 'true' if assets_active else 'false' }}"><span class="nav-icon">↗</span><span class="nav-text">Patrimônio</span><i>›</i></button><div class="nav-submenu"><a class="{{ 'active' if endpoint in ['main.investments','main.edit_investment'] }}" href="{{ url_for('main.investments') }}">Investimentos</a><a class="{{ 'active' if endpoint=='main.investment_simulator' }}" href="{{ url_for('main.investment_simulator') }}">Simulador</a></div></section>
+  <section class="nav-group {{ 'open' if settings_active }}" data-group="settings"><button class="nav-group-button" type="button" aria-expanded="{{ 'true' if settings_active else 'false' }}"><span class="nav-icon">⚙</span><span class="nav-text">Configurações</span><i>›</i></button><div class="nav-submenu"><a class="{{ 'active' if endpoint=='main.data_tools' }}" href="{{ url_for('main.data_tools') }}">Dados e backup</a></div></section>
+</nav>
+<div class="profile"><div class="avatar">{{ current_user.username[:2]|upper }}</div><div class="profile-copy"><strong>{{ current_user.username }}</strong><span>Minha conta</span></div><form method="post" action="{{ url_for('main.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button title="Sair" aria-label="Sair">↪</button></form></div></aside>
+<section class="content">{% with messages=get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-wrap">{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}{% endwith %}{% block content %}{% endblock %}</section></div>
+<script>
+(()=>{const body=document.body,sidebar=document.getElementById('sidebar'),collapse=document.getElementById('sidebarCollapse'),mobile=document.getElementById('mobileMenuButton'),overlay=document.getElementById('sidebarOverlay');if(localStorage.getItem('grana-sidebar-collapsed')==='1')body.classList.add('nav-collapsed');collapse.addEventListener('click',()=>{body.classList.toggle('nav-collapsed');localStorage.setItem('grana-sidebar-collapsed',body.classList.contains('nav-collapsed')?'1':'0')});document.querySelectorAll('.nav-group-button').forEach(button=>button.addEventListener('click',()=>{const group=button.closest('.nav-group'),willOpen=!group.classList.contains('open');if(willOpen)document.querySelectorAll('.nav-group.open').forEach(item=>{if(item!==group){item.classList.remove('open');item.querySelector('.nav-group-button').setAttribute('aria-expanded','false')}});group.classList.toggle('open',willOpen);button.setAttribute('aria-expanded',willOpen?'true':'false')}));const closeMobile=()=>{body.classList.remove('nav-mobile-open');mobile.setAttribute('aria-expanded','false')};mobile.addEventListener('click',()=>{body.classList.toggle('nav-mobile-open');mobile.setAttribute('aria-expanded',body.classList.contains('nav-mobile-open')?'true':'false')});overlay.addEventListener('click',closeMobile);sidebar.querySelectorAll('a').forEach(link=>link.addEventListener('click',closeMobile))})();
+</script>
+{% else %}{% block guest %}{% endblock %}{% endif %}</body></html>

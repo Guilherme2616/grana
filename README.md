@@ -26,6 +26,8 @@ Aplicação Flask independente para organizar contas, movimentações, categoria
 - Fechamento e reabertura mensal com fotografia dos resultados;
 - Importação de CSV e OFX, exportação CSV e backup JSON;
 - Carteira de investimentos com posição, preço médio, cotação manual, resultado e proventos;
+- Menu lateral agrupado e recolhível, com contadores de alertas e faturas pendentes;
+- Navegação móvel em painel lateral e abertura automática do grupo da página atual;
 - Edição das configurações padrão do cartão;
 - Fechamento e vencimento específicos para cada mês/fatura;
 - Lançamentos de receitas e despesas;
