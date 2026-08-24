@@ -6,7 +6,7 @@ import pytest
 
 from app import create_app
 from app.extensions import db
-from app.models import Account, CardCycle, Category, CreditCard, Investment, Invoice, InvoiceItem, Transaction, User
+from app.models import Account, CardCycle, Category, CategoryRule, CreditCard, Investment, Invoice, InvoiceItem, Transaction, TransactionSplit, User
 from app.services.drive_sync import month_folder_matches, normalize_folder_name
 from app.services.financial_analytics import build_installment_projection, month_label, shift_month
 from app.services.invoice_parser import (
@@ -74,6 +74,43 @@ def test_create_transaction(client, app):
     with app.app_context():
         assert Transaction.query.count() == 1
         assert Transaction.query.first().amount == Decimal("50.90")
+
+
+def test_category_hierarchy_rule_edit_and_safe_delete(client, app):
+    login(client)
+    with app.app_context():
+        root = Category.query.filter_by(name="Alimentação").first()
+        root_id = root.id
+    response = client.post("/categorias", data={"name":"Delivery","kind":"expense","parent_id":root_id,"necessity":"nonessential","frequency":"variable","monthly_budget":"200,00","color":"#123456","icon":"D"}, follow_redirects=True)
+    assert "Delivery" in response.text
+    with app.app_context():
+        child = Category.query.filter_by(name="Delivery").first(); child_id = child.id
+        assert child.parent_id == root_id
+        assert child.monthly_budget == Decimal("200.00")
+    client.post("/categorias/regras", data={"pattern":"IFOOD","category_id":child_id}, follow_redirects=True)
+    client.post("/movimentacoes", data={"description":"IFOOD PEDIDO","amount":"42,00","kind":"expense","transaction_date":date.today().isoformat()}, follow_redirects=True)
+    with app.app_context():
+        assert Transaction.query.first().category_id == child_id
+        assert CategoryRule.query.filter_by(pattern="IFOOD").count() == 1
+    response = client.post(f"/categorias/{child_id}/excluir", data={"replacement_id":root_id,"confirm_reassign":"yes"}, follow_redirects=True)
+    assert "histórico preservado" in response.text
+    with app.app_context():
+        assert Category.query.filter_by(id=child_id).first() is None
+        assert Transaction.query.first().category_id == root_id
+
+
+def test_split_transaction_requires_exact_total(client, app):
+    login(client)
+    with app.app_context():
+        first = Category.query.first()
+        second = Category(name="Higiene", kind="expense")
+        transaction = Transaction(description="Compra mista", amount=Decimal("100"), kind="expense", transaction_date=date.today(), category_id=first.id)
+        db.session.add_all([second, transaction]); db.session.commit()
+        ids = (transaction.id, first.id, second.id)
+    client.post(f"/movimentacoes/{ids[0]}/dividir", data={"split_category_id":[ids[1],ids[2]],"split_amount":["70,00","30,00"]}, follow_redirects=True)
+    with app.app_context():
+        assert TransactionSplit.query.filter_by(transaction_id=ids[0]).count() == 2
+        assert Transaction.query.get(ids[0]).category_id is None
 
 
 def test_money_and_date_parser():

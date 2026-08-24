@@ -36,7 +36,7 @@
         <td>{{ item.purchase_date.strftime('%d/%m/%Y') }}</td>
         <td><input name="description_{{ item.id }}" value="{{ item.description }}" required></td>
         <td>{% if item.installment_total %}<span class="installment-chip">{{ item.installment_current }}/{{ item.installment_total }}</span>{% else %}—{% endif %}</td>
-        <td><select name="category_{{ item.id }}"><option value="">Sem categoria</option>{% for category in categories %}<option value="{{ category.id }}">{{ category.name }}</option>{% endfor %}</select></td>
+        <td><select name="category_{{ item.id }}"><option value="">Sem categoria</option>{% for category in categories %}<option value="{{ category.id }}" {{ 'selected' if item.category_id == category.id }}>{{ category.full_name }}</option>{% endfor %}</select></td>
         <td><input class="amount-input" name="amount_{{ item.id }}" value="{{ '%.2f'|format(item.amount)|replace('.', ',') }}"></td>
       </tr>
     {% endfor %}

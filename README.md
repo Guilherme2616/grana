@@ -8,6 +8,12 @@ Aplicação Flask independente para organizar contas, movimentações, categoria
 - Dashboard com saldo, entradas, saídas e últimas movimentações;
 - Central de indicadores com filtros mensais, patrimônio, evolução, categorias, cartões, origem das compras e alertas;
 - Cadastro de contas, categorias e cartões;
+- Categorias principais e subcategorias em dois níveis;
+- Edição, arquivamento e exclusão segura com reatribuição do histórico;
+- Classificação essencial/não essencial e fixa/variável/eventual;
+- Orçamento mensal por categoria com alertas nos indicadores;
+- Regras automáticas por descrição, inclusive nas faturas importadas;
+- Divisão de uma compra entre várias categorias;
 - Edição das configurações padrão do cartão;
 - Fechamento e vencimento específicos para cada mês/fatura;
 - Lançamentos de receitas e despesas;

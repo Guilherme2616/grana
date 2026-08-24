@@ -36,6 +36,29 @@ class Category(db.Model):
     kind = db.Column(db.String(10), nullable=False, default="expense")
     color = db.Column(db.String(10), default="#D8B56A")
     icon = db.Column(db.String(10), default="$" )
+    parent_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
+    active = db.Column(db.Boolean, default=True, nullable=False)
+    necessity = db.Column(db.String(20), default="essential", nullable=False)
+    frequency = db.Column(db.String(20), default="variable", nullable=False)
+    monthly_budget = db.Column(db.Numeric(12, 2), nullable=True)
+    protected = db.Column(db.Boolean, default=False, nullable=False)
+    sort_order = db.Column(db.Integer, default=0, nullable=False)
+
+    parent = db.relationship("Category", remote_side=[id], backref=db.backref("children", lazy="dynamic"))
+
+    @property
+    def full_name(self):
+        return f"{self.parent.name} › {self.name}" if self.parent else self.name
+
+
+class CategoryRule(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    pattern = db.Column(db.String(120), nullable=False)
+    category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=False)
+    active = db.Column(db.Boolean, default=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    category = db.relationship("Category", backref=db.backref("rules", cascade="all, delete-orphan"))
 
 
 class CreditCard(db.Model):
@@ -83,6 +106,16 @@ class Transaction(db.Model):
     account = db.relationship("Account", backref="transactions")
     category = db.relationship("Category", backref="transactions")
     card = db.relationship("CreditCard", backref="transactions")
+
+
+class TransactionSplit(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    transaction_id = db.Column(db.Integer, db.ForeignKey("transaction.id"), nullable=False)
+    category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=False)
+    amount = db.Column(db.Numeric(12, 2), nullable=False)
+
+    transaction = db.relationship("Transaction", backref=db.backref("splits", cascade="all, delete-orphan"))
+    category = db.relationship("Category")
 
 
 class Invoice(db.Model):

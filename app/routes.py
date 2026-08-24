@@ -8,7 +8,7 @@ from flask_login import current_user, login_required, login_user, logout_user
 from sqlalchemy import extract, func
 
 from .extensions import db
-from .models import Account, CardCycle, Category, CreditCard, Investment, Invoice, InvoiceItem, Transaction, User
+from .models import Account, CardCycle, Category, CategoryRule, CreditCard, Investment, Invoice, InvoiceItem, Transaction, TransactionSplit, User
 from .services.drive_sync import (
     DriveAccessError,
     DriveConfigurationError,
@@ -45,6 +45,24 @@ def money(value):
 def form_decimal(name, default="0"):
     raw = request.form.get(name, default).strip().replace("R$", "").replace(".", "").replace(",", ".")
     return Decimal(raw)
+
+
+def category_options(kind=None, active_only=True):
+    query = Category.query
+    if kind:
+        query = query.filter_by(kind=kind)
+    if active_only:
+        query = query.filter_by(active=True)
+    return sorted(query.all(), key=lambda item: (item.parent.name if item.parent else item.name, bool(item.parent), item.sort_order, item.name))
+
+
+def automatic_category(description, kind="expense"):
+    normalized = (description or "").casefold()
+    rules = CategoryRule.query.join(Category).filter(CategoryRule.active.is_(True), Category.active.is_(True), Category.kind == kind).order_by(func.length(CategoryRule.pattern).desc()).all()
+    for rule in rules:
+        if rule.pattern.casefold() in normalized:
+            return rule.category_id
+    return None
 
 
 def display_filename(filename):
@@ -105,7 +123,9 @@ def create_invoice_draft(card, parsed, filename, drive_file_id=None):
     db.session.add(invoice)
     db.session.flush()
     for item in parsed["items"]:
-        db.session.add(InvoiceItem(invoice_id=invoice.id, **item))
+        payload = dict(item)
+        payload.setdefault("category_id", automatic_category(payload.get("description", "")))
+        db.session.add(InvoiceItem(invoice_id=invoice.id, **payload))
     parsed_items_total = sum((item["amount"] for item in parsed["items"]), Decimal("0"))
     invoice.total = parsed.get("statement_total") or parsed_items_total
     closing_date, due_date = default_cycle_dates(card, reference_month, parsed["due_date"])
@@ -136,7 +156,9 @@ def replace_invoice_draft(invoice, parsed):
         db.session.delete(item)
     db.session.flush()
     for item in parsed["items"]:
-        db.session.add(InvoiceItem(invoice_id=invoice.id, **item))
+        payload = dict(item)
+        payload.setdefault("category_id", automatic_category(payload.get("description", "")))
+        db.session.add(InvoiceItem(invoice_id=invoice.id, **payload))
     parsed_items_total = sum((item["amount"] for item in parsed["items"]), Decimal("0"))
     invoice.reference_month = parsed["reference_month"]
     invoice.source = parsed.get("adapter", "generic")
@@ -315,10 +337,12 @@ def indicators():
     daily_data = {day: Decimal("0") for day in range(1, end.day + 1)}
     expense_items = [item for item in month_items if item.kind == "expense"]
     for item in expense_items:
-        category_name = item.category.name if item.category else "Sem categoria"
-        category_color = item.category.color if item.category else "#8E8D8A"
-        category_data.setdefault(category_name, {"amount": Decimal("0"), "color": category_color})
-        category_data[category_name]["amount"] += Decimal(item.amount)
+        allocations = [(split.category, Decimal(split.amount)) for split in item.splits] or [(item.category, Decimal(item.amount))]
+        for category, allocated_amount in allocations:
+            category_name = category.full_name if category else "Sem categoria"
+            category_color = category.color if category else "#8E8D8A"
+            category_data.setdefault(category_name, {"amount": Decimal("0"), "color": category_color})
+            category_data[category_name]["amount"] += allocated_amount
         if item.card:
             card_data.setdefault(item.card.name, {"amount": Decimal("0"), "color": item.card.color})
             card_data[item.card.name]["amount"] += Decimal(item.amount)
@@ -361,6 +385,12 @@ def indicators():
     if categories and expenses and categories[0]["amount"] / expenses >= Decimal("0.40"):
         share = (categories[0]["amount"] / expenses * Decimal("100")).quantize(Decimal("1"))
         guidance.append({"tone": "warning", "title": "Gasto concentrado", "text": f"{categories[0]['name']} representa {share}% das despesas."})
+    for category in Category.query.filter(Category.active.is_(True), Category.monthly_budget.isnot(None)).all():
+        spent = sum((Decimal(split.amount) for row in expense_items for split in row.splits if split.category_id == category.id), Decimal("0"))
+        spent += sum((Decimal(row.amount) for row in expense_items if not row.splits and row.category_id == category.id), Decimal("0"))
+        if category.monthly_budget and spent >= Decimal(category.monthly_budget) * Decimal("0.90"):
+            percent = (spent / Decimal(category.monthly_budget) * 100).quantize(Decimal("1"))
+            guidance.append({"tone": "danger" if percent >= 100 else "warning", "title": f"Orçamento de {category.full_name}", "text": f"Você utilizou {percent}% do limite mensal definido."})
     if future_rows and future_rows[0]["total"]:
         guidance.append({"tone": "info", "title": "Próxima fatura provisionada", "text": f"Já existem {brl(future_rows[0]['total'])} previstos para {future_rows[0]['label']}."})
     if not guidance:
@@ -414,10 +444,11 @@ def future_invoices():
 def transactions():
     if request.method == "POST":
         try:
+            category_id = request.form.get("category_id") or automatic_category(request.form["description"], request.form["kind"])
             transaction = Transaction(
                 description=request.form["description"].strip(), amount=form_decimal("amount"),
                 kind=request.form["kind"], transaction_date=datetime.strptime(request.form["transaction_date"], "%Y-%m-%d").date(),
-                account_id=request.form.get("account_id") or None, category_id=request.form.get("category_id") or None,
+                account_id=request.form.get("account_id") or None, category_id=category_id,
                 card_id=request.form.get("card_id") or None, notes=request.form.get("notes", "").strip(),
             )
             if not transaction.description or transaction.amount <= 0:
@@ -427,7 +458,7 @@ def transactions():
         except (ValueError, InvalidOperation):
             db.session.rollback(); flash("Confira a descrição, o valor e a data.", "danger")
     items = Transaction.query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).all()
-    return render_template("transactions.html", transactions=items, accounts=Account.query.filter_by(active=True).all(), categories=Category.query.order_by(Category.name).all(), cards=CreditCard.query.filter_by(active=True).all(), today=date.today())
+    return render_template("transactions.html", transactions=items, accounts=Account.query.filter_by(active=True).all(), categories=category_options(), cards=CreditCard.query.filter_by(active=True).all(), today=date.today())
 
 
 @main.post("/movimentacoes/<int:item_id>/excluir")
@@ -435,6 +466,34 @@ def transactions():
 def delete_transaction(item_id):
     item = db.get_or_404(Transaction, item_id); db.session.delete(item); db.session.commit(); flash("Lançamento excluído.", "success")
     return redirect(url_for("main.transactions"))
+
+
+@main.route("/movimentacoes/<int:item_id>/dividir", methods=["GET", "POST"])
+@login_required
+def split_transaction(item_id):
+    item = db.get_or_404(Transaction, item_id)
+    categories = category_options(item.kind)
+    if request.method == "POST":
+        try:
+            category_ids = request.form.getlist("split_category_id")
+            amounts = request.form.getlist("split_amount")
+            parts = []
+            for category_id, raw_amount in zip(category_ids, amounts):
+                amount = Decimal(raw_amount.strip().replace(".", "").replace(",", "."))
+                category = db.session.get(Category, int(category_id))
+                if not category or category.kind != item.kind or amount <= 0:
+                    raise ValueError
+                parts.append((category.id, amount))
+            if len(parts) < 2 or sum((part[1] for part in parts), Decimal("0")) != Decimal(item.amount):
+                raise ValueError
+            TransactionSplit.query.filter_by(transaction_id=item.id).delete()
+            for category_id, amount in parts:
+                db.session.add(TransactionSplit(transaction_id=item.id, category_id=category_id, amount=amount))
+            item.category_id = None
+            db.session.commit(); flash("Compra dividida entre as categorias.", "success"); return redirect(url_for("main.transactions"))
+        except (ValueError, InvalidOperation):
+            db.session.rollback(); flash("A divisão precisa ter ao menos duas partes e somar exatamente o valor da compra.", "danger")
+    return render_template("split_transaction.html", item=item, categories=categories)
 
 
 @main.route("/contas", methods=["GET", "POST"])
@@ -453,11 +512,88 @@ def accounts():
 @login_required
 def categories():
     if request.method == "POST":
-        name = request.form["name"].strip()
-        if name:
-            db.session.add(Category(name=name, kind=request.form.get("kind", "expense"), color=request.form.get("color", "#D8B56A"), icon=request.form.get("icon", "$")))
+        try:
+            name = request.form["name"].strip()
+            kind = request.form.get("kind", "expense")
+            parent_id = request.form.get("parent_id") or None
+            parent = db.session.get(Category, int(parent_id)) if parent_id else None
+            if not name or kind not in {"expense", "income", "transfer", "investment", "refund"} or (parent and (parent.parent_id or parent.kind != kind)):
+                raise ValueError
+            duplicate = Category.query.filter(func.lower(Category.name) == name.lower(), Category.parent_id == parent_id).first()
+            if duplicate:
+                flash("Já existe uma categoria com esse nome neste nível.", "warning")
+                return redirect(url_for("main.categories"))
+            budget = form_decimal("monthly_budget") if request.form.get("monthly_budget", "").strip() else None
+            db.session.add(Category(name=name, kind=kind, parent_id=parent_id, color=request.form.get("color", "#D8B56A"), icon=request.form.get("icon", "$"), necessity=request.form.get("necessity", "essential"), frequency=request.form.get("frequency", "variable"), monthly_budget=budget))
             db.session.commit(); flash("Categoria adicionada.", "success"); return redirect(url_for("main.categories"))
-    return render_template("categories.html", categories=Category.query.order_by(Category.kind, Category.name).all())
+        except (ValueError, InvalidOperation):
+            db.session.rollback(); flash("Confira os dados da categoria.", "danger")
+    roots = Category.query.filter_by(parent_id=None).order_by(Category.kind, Category.sort_order, Category.name).all()
+    return render_template("categories.html", roots=roots, categories=category_options(active_only=False), rules=CategoryRule.query.order_by(CategoryRule.pattern).all())
+
+
+@main.route("/categorias/<int:category_id>/editar", methods=["GET", "POST"])
+@login_required
+def edit_category(category_id):
+    item = db.get_or_404(Category, category_id)
+    if request.method == "POST":
+        try:
+            name = request.form["name"].strip()
+            if not name:
+                raise ValueError
+            item.name, item.color, item.icon = name, request.form.get("color", item.color), request.form.get("icon", item.icon)
+            item.necessity, item.frequency = request.form.get("necessity", "essential"), request.form.get("frequency", "variable")
+            item.monthly_budget = form_decimal("monthly_budget") if request.form.get("monthly_budget", "").strip() else None
+            item.active = request.form.get("active") == "on"
+            db.session.commit(); flash("Categoria atualizada.", "success"); return redirect(url_for("main.categories"))
+        except (ValueError, InvalidOperation):
+            db.session.rollback(); flash("Confira os dados da categoria.", "danger")
+    alternatives = [row for row in category_options(item.kind, active_only=False) if row.id != item.id]
+    return render_template("edit_category.html", item=item, alternatives=alternatives)
+
+
+@main.post("/categorias/<int:category_id>/excluir")
+@login_required
+def delete_category(category_id):
+    item = db.get_or_404(Category, category_id)
+    if item.protected:
+        flash("Esta é uma categoria protegida e não pode ser excluída.", "warning"); return redirect(url_for("main.categories"))
+    replacement_id = request.form.get("replacement_id") or None
+    replacement = db.session.get(Category, int(replacement_id)) if replacement_id else None
+    if replacement and (replacement.id == item.id or replacement.kind != item.kind):
+        flash("A categoria de destino é inválida.", "danger"); return redirect(url_for("main.categories"))
+    affected = Transaction.query.filter_by(category_id=item.id).count() + InvoiceItem.query.filter_by(category_id=item.id).count() + TransactionSplit.query.filter_by(category_id=item.id).count()
+    if affected and request.form.get("confirm_reassign") != "yes":
+        flash("Escolha um destino e confirme a reatribuição antes de excluir.", "warning"); return redirect(url_for("main.categories"))
+    for child in item.children.all():
+        child.parent_id = None
+    Transaction.query.filter_by(category_id=item.id).update({"category_id": replacement.id if replacement else None})
+    InvoiceItem.query.filter_by(category_id=item.id).update({"category_id": replacement.id if replacement else None})
+    if replacement:
+        TransactionSplit.query.filter_by(category_id=item.id).update({"category_id": replacement.id})
+    else:
+        TransactionSplit.query.filter_by(category_id=item.id).delete()
+    db.session.delete(item); db.session.commit(); flash("Categoria excluída e histórico preservado.", "success")
+    return redirect(url_for("main.categories"))
+
+
+@main.post("/categorias/regras")
+@login_required
+def add_category_rule():
+    pattern = request.form.get("pattern", "").strip()
+    category = db.session.get(Category, int(request.form.get("category_id", 0)))
+    if not pattern or not category:
+        flash("Informe o texto e a categoria da regra.", "danger")
+    else:
+        db.session.add(CategoryRule(pattern=pattern, category_id=category.id)); db.session.commit(); flash("Regra automática adicionada.", "success")
+    return redirect(url_for("main.categories"))
+
+
+@main.post("/categorias/regras/<int:rule_id>/excluir")
+@login_required
+def delete_category_rule(rule_id):
+    db.session.delete(db.get_or_404(CategoryRule, rule_id)); db.session.commit(); flash("Regra removida.", "success")
+    return redirect(url_for("main.categories"))
 
 
 @main.route("/cartoes", methods=["GET", "POST"])
@@ -634,7 +770,7 @@ def sync_drive_invoices():
 def review_invoice(invoice_id):
     invoice = db.get_or_404(Invoice, invoice_id)
     if invoice.status != "draft": return redirect(url_for("main.dashboard"))
-    categories = Category.query.filter_by(kind="expense").order_by(Category.name).all()
+    categories = category_options("expense")
     suggestion = invoice_review_suggestion(invoice)
     if request.method == "POST":
         selected_ids = {int(value) for value in request.form.getlist("selected")}
@@ -649,7 +785,7 @@ def review_invoice(invoice_id):
             item.description = request.form.get(f"description_{item.id}", item.description).strip()[:180]
             try: item.amount = Decimal(request.form.get(f"amount_{item.id}", str(item.amount)).replace(".", "").replace(",", "."))
             except InvalidOperation: pass
-            item.category_id = request.form.get(f"category_{item.id}") or None
+            item.category_id = request.form.get(f"category_{item.id}") or automatic_category(item.description)
             if item.selected:
                 total += item.amount
                 db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id))

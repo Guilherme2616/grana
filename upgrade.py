@@ -29,6 +29,15 @@ with app.app_context():
             "installment_current": "ALTER TABLE invoice_item ADD COLUMN installment_current INTEGER",
             "installment_total": "ALTER TABLE invoice_item ADD COLUMN installment_total INTEGER",
         },
+        "category": {
+            "parent_id": "ALTER TABLE category ADD COLUMN parent_id INTEGER REFERENCES category(id)",
+            "active": "ALTER TABLE category ADD COLUMN active BOOLEAN DEFAULT 1 NOT NULL",
+            "necessity": "ALTER TABLE category ADD COLUMN necessity VARCHAR(20) DEFAULT 'essential' NOT NULL",
+            "frequency": "ALTER TABLE category ADD COLUMN frequency VARCHAR(20) DEFAULT 'variable' NOT NULL",
+            "monthly_budget": "ALTER TABLE category ADD COLUMN monthly_budget NUMERIC(12, 2)",
+            "protected": "ALTER TABLE category ADD COLUMN protected BOOLEAN DEFAULT 0 NOT NULL",
+            "sort_order": "ALTER TABLE category ADD COLUMN sort_order INTEGER DEFAULT 0 NOT NULL",
+        },
     }
     for table_name, columns in migrations.items():
         existing = {column["name"] for column in inspector.get_columns(table_name)}
