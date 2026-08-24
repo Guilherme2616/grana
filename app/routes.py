@@ -6,7 +6,6 @@ from io import BytesIO
 from flask import Blueprint, flash, redirect, render_template, request, session, url_for
 from flask_login import current_user, login_required, login_user, logout_user
 from sqlalchemy import extract, func
-from werkzeug.utils import secure_filename
 
 from .extensions import db
 from .models import Account, CardCycle, Category, CreditCard, Investment, Invoice, InvoiceItem, Transaction, User
@@ -46,6 +45,10 @@ def money(value):
 def form_decimal(name, default="0"):
     raw = request.form.get(name, default).strip().replace("R$", "").replace(".", "").replace(",", ".")
     return Decimal(raw)
+
+
+def display_filename(filename):
+    return (filename or "fatura.pdf").replace("\\", "/").rsplit("/", 1)[-1].strip()[:255]
 
 
 def safe_date(year, month, day):
@@ -91,11 +94,12 @@ def create_invoice_draft(card, parsed, filename, drive_file_id=None):
     invoice = Invoice(
         card_id=card.id,
         reference_month=reference_month,
-        original_filename=secure_filename(filename),
+        original_filename=display_filename(filename),
         status="draft",
         source=parsed.get("adapter", "generic"),
         credit_limit=parsed.get("credit_limit"),
         cash_advance_total=parsed.get("cash_advance_total"),
+        statement_total=parsed.get("statement_total"),
         drive_file_id=drive_file_id,
     )
     db.session.add(invoice)
@@ -105,16 +109,47 @@ def create_invoice_draft(card, parsed, filename, drive_file_id=None):
     parsed_items_total = sum((item["amount"] for item in parsed["items"]), Decimal("0"))
     invoice.total = parsed.get("statement_total") or parsed_items_total
     closing_date, due_date = default_cycle_dates(card, reference_month, parsed["due_date"])
-    session[f"invoice_cycle_{invoice.id}"] = {
+    invoice.suggested_closing_date = closing_date
+    invoice.suggested_due_date = due_date
+    invoice.date_source = "pdf" if parsed["due_date"] else "default"
+    return invoice
+
+
+def invoice_review_suggestion(invoice):
+    closing_date = invoice.suggested_closing_date
+    due_date = invoice.suggested_due_date
+    if not closing_date or not due_date:
+        closing_date, due_date = default_cycle_dates(invoice.card, invoice.reference_month)
+    return {
         "closing_date": closing_date.isoformat(),
         "due_date": due_date.isoformat(),
-        "source": "pdf" if parsed["due_date"] else "default",
-        "statement_total": str(parsed.get("statement_total") or ""),
-        "adapter": parsed.get("adapter", "generic"),
-        "credit_limit": str(parsed.get("credit_limit") or ""),
-        "cash_advance_total": str(parsed.get("cash_advance_total") or ""),
+        "source": invoice.date_source or "default",
+        "statement_total": str(invoice.statement_total or ""),
+        "adapter": invoice.source,
+        "credit_limit": str(invoice.credit_limit or ""),
+        "cash_advance_total": str(invoice.cash_advance_total or ""),
     }
-    return invoice
+
+
+def replace_invoice_draft(invoice, parsed):
+    for item in list(invoice.items):
+        db.session.delete(item)
+    db.session.flush()
+    for item in parsed["items"]:
+        db.session.add(InvoiceItem(invoice_id=invoice.id, **item))
+    parsed_items_total = sum((item["amount"] for item in parsed["items"]), Decimal("0"))
+    invoice.reference_month = parsed["reference_month"]
+    invoice.source = parsed.get("adapter", "generic")
+    invoice.credit_limit = parsed.get("credit_limit")
+    invoice.cash_advance_total = parsed.get("cash_advance_total")
+    invoice.statement_total = parsed.get("statement_total")
+    invoice.total = invoice.statement_total or parsed_items_total
+    closing_date, due_date = default_cycle_dates(
+        invoice.card, invoice.reference_month, parsed.get("due_date")
+    )
+    invoice.suggested_closing_date = closing_date
+    invoice.suggested_due_date = due_date
+    invoice.date_source = "pdf" if parsed.get("due_date") else "default"
 
 
 def parse_with_saved_passwords(stream_factory, reference_month, cards):
@@ -509,6 +544,23 @@ def import_invoice():
     return render_template("import_invoice.html", cards=cards, drive_configured=drive_is_configured())
 
 
+@main.get("/faturas")
+@login_required
+def invoices():
+    status = request.args.get("status", "all")
+    query = Invoice.query
+    if status in {"draft", "confirmed"}:
+        query = query.filter_by(status=status)
+    invoice_rows = query.order_by(Invoice.created_at.desc()).all()
+    pending_count = Invoice.query.filter_by(status="draft").count()
+    return render_template(
+        "invoices.html",
+        invoices=invoice_rows,
+        current_status=status,
+        pending_count=pending_count,
+    )
+
+
 @main.post("/faturas/sincronizar-drive")
 @login_required
 def sync_drive_invoices():
@@ -524,8 +576,18 @@ def sync_drive_invoices():
     results = []
     for drive_file in files:
         filename = drive_file["name"]
-        if Invoice.query.filter_by(drive_file_id=drive_file["id"]).first():
-            results.append({"filename": filename, "status": "Já importada", "tone": "muted", "detail": "Nenhuma duplicação foi criada."})
+        existing = Invoice.query.filter_by(drive_file_id=drive_file["id"]).first()
+        if existing:
+            if existing.status == "draft":
+                results.append({
+                    "filename": filename,
+                    "status": "Aguardando revisão",
+                    "tone": "warning",
+                    "detail": "A importação já foi iniciada. Continue de onde parou.",
+                    "invoice_id": existing.id,
+                })
+            else:
+                results.append({"filename": filename, "status": "Já importada", "tone": "muted", "detail": "Nenhuma duplicação foi criada."})
             continue
         try:
             downloaded = download_pdf(drive_session, drive_file["id"]).getvalue()
@@ -573,10 +635,7 @@ def review_invoice(invoice_id):
     invoice = db.get_or_404(Invoice, invoice_id)
     if invoice.status != "draft": return redirect(url_for("main.dashboard"))
     categories = Category.query.filter_by(kind="expense").order_by(Category.name).all()
-    suggestion = session.get(f"invoice_cycle_{invoice.id}")
-    if not suggestion:
-        closing_date, due_date = default_cycle_dates(invoice.card, invoice.reference_month)
-        suggestion = {"closing_date": closing_date.isoformat(), "due_date": due_date.isoformat(), "source": "default"}
+    suggestion = invoice_review_suggestion(invoice)
     if request.method == "POST":
         selected_ids = {int(value) for value in request.form.getlist("selected")}
         closing_date = datetime.strptime(request.form["closing_date"], "%Y-%m-%d").date()
@@ -596,13 +655,70 @@ def review_invoice(invoice_id):
                 db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id))
         source = "pdf" if request.form.get("date_source") == "pdf" else "manual"
         upsert_card_cycle(invoice.card, invoice.reference_month, closing_date, due_date, source)
-        official_total = suggestion.get("statement_total")
+        official_total = invoice.statement_total
         invoice.total = Decimal(official_total) if official_total else total
         invoice.status = "confirmed"; db.session.commit()
         session.pop(f"invoice_cycle_{invoice.id}", None)
         flash(f"Fatura importada com {len(selected_ids)} compras e datas atualizadas.", "success")
         return redirect(url_for("main.dashboard"))
     return render_template("review_invoice.html", invoice=invoice, categories=categories, suggestion=suggestion)
+
+
+@main.post("/faturas/<int:invoice_id>/descartar")
+@login_required
+def discard_invoice(invoice_id):
+    invoice = db.get_or_404(Invoice, invoice_id)
+    if invoice.status != "draft":
+        flash("Somente faturas aguardando revisão podem ser descartadas.", "warning")
+        return redirect(url_for("main.invoices"))
+    filename = invoice.original_filename or "Fatura"
+    session.pop(f"invoice_cycle_{invoice.id}", None)
+    db.session.delete(invoice)
+    db.session.commit()
+    flash(f"{filename} foi descartada e já pode ser importada novamente.", "success")
+    return redirect(url_for("main.invoices", status="draft"))
+
+
+@main.post("/faturas/<int:invoice_id>/reprocessar")
+@login_required
+def reprocess_invoice(invoice_id):
+    invoice = db.get_or_404(Invoice, invoice_id)
+    if invoice.status != "draft":
+        flash("Somente faturas aguardando revisão podem ser reprocessadas.", "warning")
+        return redirect(url_for("main.invoices"))
+    if not invoice.drive_file_id:
+        flash("Esta fatura foi enviada manualmente. Descarte-a e envie o PDF novamente.", "warning")
+        return redirect(url_for("main.review_invoice", invoice_id=invoice.id))
+
+    try:
+        cards = CreditCard.query.filter_by(active=True).all()
+        drive_session, files = list_month_pdfs(invoice.reference_month)
+        drive_file = next(
+            (item for item in files if item["id"] == invoice.drive_file_id),
+            None,
+        )
+        if not drive_file:
+            raise DriveAccessError("O PDF não está mais na pasta desse mês no Google Drive.")
+        downloaded = download_pdf(drive_session, invoice.drive_file_id).getvalue()
+        parsed = parse_with_saved_passwords(
+            lambda data=downloaded: BytesIO(data), invoice.reference_month, cards
+        )
+        if not parsed["items"]:
+            raise ValueError("Nenhuma compra foi encontrada no novo processamento.")
+        if parsed.get("adapter") != invoice.card.invoice_provider:
+            raise ValueError("O banco identificado não corresponde ao cartão deste rascunho.")
+        replace_invoice_draft(invoice, parsed)
+        invoice.original_filename = display_filename(drive_file["name"])
+        db.session.commit()
+        flash("Fatura processada novamente. Confira os lançamentos encontrados.", "success")
+        return redirect(url_for("main.review_invoice", invoice_id=invoice.id))
+    except (PdfPasswordRequired, PdfPasswordInvalid, DriveAccessError, DriveConfigurationError, ValueError) as exc:
+        db.session.rollback()
+        flash(str(exc) or "Não foi possível reprocessar a fatura.", "danger")
+    except Exception:
+        db.session.rollback()
+        flash("Não foi possível reprocessar a fatura.", "danger")
+    return redirect(url_for("main.invoices", status="draft"))
 
 
 @main.route("/investimentos", methods=["GET", "POST"])

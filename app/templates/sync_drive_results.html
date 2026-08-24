@@ -3,7 +3,7 @@
 {% block content %}
 <header class="page-head">
   <div><span class="eyebrow">GOOGLE DRIVE</span><h1>Faturas encontradas</h1><p>Resultado da pasta {{ reference_month }}. Revise cada fatura antes de confirmar.</p></div>
-  <a class="secondary-button" href="{{ url_for('main.import_invoice') }}">← Nova sincronização</a>
+  <div class="page-actions"><a class="secondary-button" href="{{ url_for('main.invoices', status='draft') }}">Ver todas as pendentes</a><a class="secondary-button" href="{{ url_for('main.import_invoice') }}">← Nova sincronização</a></div>
 </header>
 <section class="panel table-panel">
   <div class="table-wrap"><table>

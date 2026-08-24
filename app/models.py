@@ -95,6 +95,10 @@ class Invoice(db.Model):
     source = db.Column(db.String(30), default="generic", nullable=False)
     credit_limit = db.Column(db.Numeric(12, 2), nullable=True)
     cash_advance_total = db.Column(db.Numeric(12, 2), nullable=True)
+    statement_total = db.Column(db.Numeric(12, 2), nullable=True)
+    suggested_closing_date = db.Column(db.Date, nullable=True)
+    suggested_due_date = db.Column(db.Date, nullable=True)
+    date_source = db.Column(db.String(20), default="default", nullable=False)
     drive_file_id = db.Column(db.String(255), unique=True, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 

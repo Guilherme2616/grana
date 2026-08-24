@@ -19,6 +19,10 @@ with app.app_context():
             "source": "ALTER TABLE invoice ADD COLUMN source VARCHAR(30) DEFAULT 'generic' NOT NULL",
             "credit_limit": "ALTER TABLE invoice ADD COLUMN credit_limit NUMERIC(12, 2)",
             "cash_advance_total": "ALTER TABLE invoice ADD COLUMN cash_advance_total NUMERIC(12, 2)",
+            "statement_total": "ALTER TABLE invoice ADD COLUMN statement_total NUMERIC(12, 2)",
+            "suggested_closing_date": "ALTER TABLE invoice ADD COLUMN suggested_closing_date DATE",
+            "suggested_due_date": "ALTER TABLE invoice ADD COLUMN suggested_due_date DATE",
+            "date_source": "ALTER TABLE invoice ADD COLUMN date_source VARCHAR(20) DEFAULT 'default' NOT NULL",
             "drive_file_id": "ALTER TABLE invoice ADD COLUMN drive_file_id VARCHAR(255)",
         },
         "invoice_item": {
@@ -31,6 +35,11 @@ with app.app_context():
         for column_name, statement in columns.items():
             if column_name not in existing:
                 db.session.execute(text(statement))
+    db.session.commit()
+    db.session.execute(text(
+        "UPDATE invoice SET statement_total = total "
+        "WHERE statement_total IS NULL AND status = 'draft'"
+    ))
     db.session.commit()
     db.session.execute(text(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_invoice_drive_file_id "

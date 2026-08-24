@@ -9,9 +9,18 @@ DATE_PATTERN = re.compile(r"(?P<date>\d{2}/\d{2}(?:/\d{2,4})?)")
 AMOUNT_TEXT = r"\d{1,3}(?:\.\d{3})*,\d{2}"
 AMOUNT_PATTERN = re.compile(rf"(?P<amount>-?\s*(?:R\$\s*)?{AMOUNT_TEXT}-?)\s*$")
 EXPIRY_WORD_PATTERN = re.compile(r"\b(?:data\s+de\s+)?vencimento\b|\bvence\b", re.IGNORECASE)
-BB_SECTION_PATTERN = re.compile(r"lan[cç]amentos\s+nesta\s+fatura", re.IGNORECASE)
+BB_SECTION_PATTERN = re.compile(
+    r"lan[cç]amentos(?:\s+e\s+compras|\s+realizados)?(?:\s+do\s+cart[aã]o)?"
+    r"\s+(?:nesta|desta|da)\s+fatura",
+    re.IGNORECASE,
+)
+BB_TABLE_HEADER_PATTERN = re.compile(
+    r"data\s+descri[cç][aã]o(?:\s+pa[ií]s)?\s+valor",
+    re.IGNORECASE,
+)
 BB_TOTAL_LINE_PATTERN = re.compile(r"^total(?:\s|$)", re.IGNORECASE)
 BB_COUNTRY_PATTERN = re.compile(r"\s+(?:[A-Z]{2}|\d{2})\s*$", re.IGNORECASE)
+BB_ANY_AMOUNT_PATTERN = re.compile(rf"(?P<amount>-?\s*(?:R\$\s*)?{AMOUNT_TEXT}-?)", re.IGNORECASE)
 MP_CARD_SECTION_PATTERN = re.compile(r"cart[aã]o\s+(?:visa|mastercard|elo|american\s+express)", re.IGNORECASE)
 INSTALLMENT_PATTERN = re.compile(r"\bparcela\s+(?P<current>\d+)\s+de\s+(?P<total>\d+)\b", re.IGNORECASE)
 SLASH_INSTALLMENT_PATTERN = re.compile(
@@ -103,9 +112,16 @@ def is_bb_smiles_invoice(text):
     normalized = text.lower()
     compact = re.sub(r"\s+", "", normalized)
     return (
-        ("banco do brasil" in normalized or "bancodobrasil" in compact)
+        (
+            "banco do brasil" in normalized
+            or "bancodobrasil" in compact
+            or "bb.com.br" in normalized
+        )
         and "smiles" in normalized
-        and BB_SECTION_PATTERN.search(text) is not None
+        and (
+            BB_SECTION_PATTERN.search(text) is not None
+            or BB_TABLE_HEADER_PATTERN.search(text) is not None
+        )
     )
 
 
@@ -253,6 +269,8 @@ def _append_item(
 def parse_bb_smiles_text(text, reference_month):
     section_match = BB_SECTION_PATTERN.search(text)
     if not section_match:
+        section_match = BB_TABLE_HEADER_PATTERN.search(text)
+    if not section_match:
         return []
 
     section = text[section_match.end():]
@@ -278,7 +296,9 @@ def parse_bb_smiles_text(text, reference_month):
             continue
 
         combined = " ".join(pending_parts)
-        amount_match = AMOUNT_PATTERN.search(combined)
+        # Algumas versões extraem a coluna País depois do valor; por isso o
+        # leitor do BB não exige mais que o valor seja o último texto da linha.
+        amount_match = BB_ANY_AMOUNT_PATTERN.search(combined)
         if amount_match:
             description = combined[:amount_match.start()]
             installment_match = SLASH_INSTALLMENT_PATTERN.search(description)

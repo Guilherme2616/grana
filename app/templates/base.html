@@ -18,6 +18,7 @@
       <a class="nav-item {{ 'active' if request.endpoint == 'main.indicators' }}" href="{{ url_for('main.indicators') }}"><span>◒</span>Indicadores</a>
       <a class="nav-item {{ 'active' if request.endpoint == 'main.transactions' }}" href="{{ url_for('main.transactions') }}"><span>↕</span>Movimentações</a>
       <a class="nav-item {{ 'active' if request.endpoint in ['main.cards','main.import_invoice','main.review_invoice'] }}" href="{{ url_for('main.cards') }}"><span>▣</span>Cartões</a>
+      <a class="nav-item {{ 'active' if request.endpoint == 'main.invoices' }}" href="{{ url_for('main.invoices') }}"><span>▤</span>Faturas</a>
       <a class="nav-item {{ 'active' if request.endpoint == 'main.future_invoices' }}" href="{{ url_for('main.future_invoices') }}"><span>◷</span>Próximas faturas</a>
       <a class="nav-item {{ 'active' if request.endpoint == 'main.accounts' }}" href="{{ url_for('main.accounts') }}"><span>⌂</span>Contas</a>
       <a class="nav-item {{ 'active' if request.endpoint in ['main.investments','main.edit_investment','main.investment_simulator'] }}" href="{{ url_for('main.investments') }}"><span>↗</span>Investimentos</a>

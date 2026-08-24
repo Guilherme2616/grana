@@ -121,6 +121,29 @@ def test_bb_smiles_adapter_respects_table_boundaries_and_columns():
     assert all("PARC 04/05" not in item["description"] for item in items)
 
 
+def test_bb_smiles_adapter_accepts_alternate_heading_and_country_after_amount():
+    extracted_text = """
+    BB.COM.BR
+    CARTÃO SMILES PLATINUM
+    Valor R$ 108,90
+    Vencimento 10/08/2026
+    Lançamentos e compras desta fatura
+    Data Descrição País Valor
+    07/07 APPLE.COM/BILL SAO PAULO R$ 66,90 BR
+    23/07 CLUBE LIVELO* PARC 01/12 R$ 42,00 BR
+    Total R$ 108,90
+    Parcelamentos Próxima Fatura
+    23/07 CLUBE LIVELO* PARC 02/12 R$ 42,00 BR
+    """
+    assert is_bb_smiles_invoice(extracted_text)
+    items = parse_bb_smiles_text(extracted_text, "2026-08")
+    assert len(items) == 2
+    assert items[0]["description"] == "APPLE.COM/BILL SAO PAULO"
+    assert items[1]["installment_current"] == 1
+    assert items[1]["installment_total"] == 12
+    assert sum(item["amount"] for item in items) == Decimal("108.90")
+
+
 def test_mercado_pago_adapter_ignores_payments_and_reads_installments():
     cover = """
     mercado pago
@@ -279,7 +302,7 @@ def test_import_page_shows_drive_sync(client):
     assert "Sincronizar Google Drive" in response.text
 
 
-def test_drive_sync_creates_draft_and_blocks_duplicate(client, app, monkeypatch):
+def test_drive_sync_creates_draft_and_recovers_pending_review(client, app, monkeypatch):
     login(client)
     with app.app_context():
         card = CreditCard.query.first()
@@ -309,9 +332,110 @@ def test_drive_sync_creates_draft_and_blocks_duplicate(client, app, monkeypatch)
 
     response = client.post("/faturas/sincronizar-drive", data={"reference_month": "2026-08"})
     assert response.status_code == 200
-    assert "Já importada" in response.text
+    assert "Aguardando revisão" in response.text
+    assert "Continue de onde parou" in response.text
     with app.app_context():
         assert Invoice.query.filter_by(drive_file_id="drive-file-123").count() == 1
+
+    pending = client.get("/faturas?status=draft")
+    assert pending.status_code == 200
+    assert "Banco do Brasil - Smiles.pdf" in pending.text
+    assert "Continuar" in pending.text
+
+    with app.app_context():
+        invoice = Invoice.query.filter_by(drive_file_id="drive-file-123").first()
+        invoice_id = invoice.id
+        assert invoice.suggested_due_date == date(2026, 8, 10)
+        assert invoice.date_source == "pdf"
+
+    with client.session_transaction() as browser_session:
+        browser_session.clear()
+    login(client)
+    review = client.get(f"/faturas/{invoice_id}/revisar")
+    assert review.status_code == 200
+    assert 'value="2026-08-10"' in review.text
+
+
+def test_discard_pending_invoice_releases_drive_file(client, app):
+    login(client)
+    with app.app_context():
+        card = CreditCard.query.first()
+        invoice = Invoice(
+            card_id=card.id,
+            reference_month="2026-08",
+            total=Decimal("25.00"),
+            statement_total=Decimal("25.00"),
+            status="draft",
+            original_filename="fatura.pdf",
+            drive_file_id="drive-file-to-discard",
+        )
+        db.session.add(invoice)
+        db.session.commit()
+        invoice_id = invoice.id
+
+    response = client.post(f"/faturas/{invoice_id}/descartar", follow_redirects=True)
+    assert response.status_code == 200
+    assert "já pode ser importada novamente" in response.text
+    with app.app_context():
+        assert db.session.get(Invoice, invoice_id) is None
+        assert Invoice.query.filter_by(drive_file_id="drive-file-to-discard").count() == 0
+
+
+def test_reprocess_drive_draft_replaces_items(client, app, monkeypatch):
+    login(client)
+    with app.app_context():
+        card = CreditCard.query.first()
+        card.invoice_provider = "bb_smiles"
+        invoice = Invoice(
+            card_id=card.id,
+            reference_month="2026-08",
+            total=Decimal("10.00"),
+            statement_total=Decimal("10.00"),
+            status="draft",
+            original_filename="fatura.pdf",
+            drive_file_id="drive-file-reprocess",
+        )
+        db.session.add(invoice)
+        db.session.flush()
+        db.session.add(InvoiceItem(
+            invoice_id=invoice.id,
+            purchase_date=date(2026, 8, 1),
+            description="ITEM ANTIGO",
+            amount=Decimal("10.00"),
+        ))
+        db.session.commit()
+        invoice_id = invoice.id
+
+    parsed = {
+        "items": [{
+            "purchase_date": date(2026, 8, 5),
+            "description": "ITEM CORRIGIDO",
+            "amount": Decimal("30.00"),
+            "installment_current": None,
+            "installment_total": None,
+        }],
+        "due_date": date(2026, 8, 10),
+        "statement_total": Decimal("30.00"),
+        "reference_month": "2026-08",
+        "adapter": "bb_smiles",
+        "credit_limit": None,
+        "cash_advance_total": None,
+    }
+    monkeypatch.setattr(
+        "app.routes.list_month_pdfs",
+        lambda month: (object(), [{"id": "drive-file-reprocess", "name": "BB Smiles.pdf"}]),
+    )
+    monkeypatch.setattr("app.routes.download_pdf", lambda drive_session, file_id: BytesIO(b"pdf"))
+    monkeypatch.setattr("app.routes.parse_with_saved_passwords", lambda factory, month, cards: parsed)
+
+    response = client.post(f"/faturas/{invoice_id}/reprocessar", follow_redirects=True)
+    assert response.status_code == 200
+    assert "Fatura processada novamente" in response.text
+    with app.app_context():
+        invoice = db.session.get(Invoice, invoice_id)
+        assert invoice.total == Decimal("30.00")
+        assert invoice.items[0].description == "ITEM CORRIGIDO"
+        assert len(invoice.items) == 1
 
 
 def test_financial_indicators_provisioning_and_simulator_pages(client, app):

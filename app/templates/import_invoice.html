@@ -3,6 +3,7 @@
 {% block content %}
 <header class="page-head">
   <div><span class="eyebrow">FATURA INTELIGENTE</span><h1>Importar faturas</h1><p>Busque um mês inteiro no Google Drive ou envie um PDF manualmente.</p></div>
+  <a class="secondary-button" href="{{ url_for('main.invoices', status='draft') }}">Ver faturas pendentes →</a>
 </header>
 
 <section class="drive-sync-card panel">

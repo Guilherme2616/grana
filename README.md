@@ -18,6 +18,10 @@ Aplicação Flask independente para organizar contas, movimentações, categoria
 - Leitura de PDFs protegidos por senha e armazenamento opcional criptografado por cartão;
 - Sugestão automática do vencimento encontrado no PDF;
 - Revisão de cada compra antes da confirmação;
+- Central de faturas com filtros para pendentes e confirmadas;
+- Continuação de uma revisão mesmo depois de sair da tela ou encerrar a sessão;
+- Descarte seguro de rascunhos para permitir uma nova importação;
+- Reprocessamento de PDFs do Google Drive sem criar duplicações;
 - Conversão das compras confirmadas em lançamentos;
 - Banco SQLite, adequado para um único usuário;
 - Layout responsivo para computador e celular;
@@ -27,7 +31,7 @@ Aplicação Flask independente para organizar contas, movimentações, categoria
 - Provisionamento de parcelas para as próximas 12 faturas, substituído pelo valor real quando a fatura já estiver confirmada;
 - Simulador de investimentos e poupança com aportes, cenários, inflação, IR regressivo, resultado líquido e evolução anual.
 
-> A leitura usa o texto interno do PDF. No Banco do Brasil Smiles, considera somente “Lançamentos nesta fatura” até “Total”. No Mercado Pago, começa na tabela do cartão, ignora pagamentos de faturas, identifica parcelas e termina em “Total”, mesmo quando a tabela ocupa mais páginas. No Banco Inter, usa “Despesas do mês” como total e importa somente os gastos da página analítica, descartando pagamentos/créditos e as páginas posteriores. No Itaú, começa em “Lançamentos: compras e saques”, inclui produtos e serviços, encerra antes das próximas faturas e confere os subtotais com o total da capa. A tela de revisão continua obrigatória.
+> A leitura usa o texto interno do PDF. No Banco do Brasil Smiles, aceita variações do título da tabela, descrições quebradas em várias linhas e a coluna País antes ou depois do valor; considera somente os lançamentos atuais até “Total”. No Mercado Pago, começa na tabela do cartão, ignora pagamentos de faturas, identifica parcelas e termina em “Total”, mesmo quando a tabela ocupa mais páginas. No Banco Inter, usa “Despesas do mês” como total e importa somente os gastos da página analítica, descartando pagamentos/créditos e as páginas posteriores. No Itaú, começa em “Lançamentos: compras e saques”, inclui produtos e serviços, encerra antes das próximas faturas e confere os subtotais com o total da capa. A tela de revisão continua obrigatória.
 
 PDFs protegidos por senha são aceitos. Na importação manual, a senha é descartada depois da leitura. Para a sincronização do Drive, ela pode ser salva criptografada na configuração do cartão. A chave secreta do aplicativo precisa permanecer estável para que o sistema consiga descriptografá-la. PDFs que sejam somente imagens ainda precisam de OCR.
 
@@ -65,7 +69,7 @@ os.environ["GOOGLE_DRIVE_ROOT_FOLDER_ID"] = "ID_DA_PASTA_FATURAS_GRANA"
 8. No Grana, abra cada cartão, escolha seu banco e salve a senha do PDF, caso exista;
 9. Em **Importar faturas**, selecione o mês e clique em **Sincronizar pasta**.
 
-As faturas são criadas como rascunho. Cada uma deve ser revisada e confirmada antes de virar lançamento.
+As faturas são criadas como rascunho. Cada uma deve ser revisada e confirmada antes de virar lançamento. Se você sair da tela, abra **Faturas → Aguardando revisão** para continuar. Um rascunho do Drive pode ser reprocessado; ao descartá-lo, o mesmo PDF fica liberado para uma nova importação.
 
 ## Rodar no computador
 
@@ -165,7 +169,7 @@ pip install -r requirements.txt
 python upgrade.py
 ```
 
-Depois volte à aba **Web** e clique em **Reload**. O `upgrade.py` cria somente as novas tabelas e categorias que estiverem faltando, preservando seus registros atuais.
+Depois volte à aba **Web** e clique em **Reload**. O `upgrade.py` cria somente as novas tabelas, colunas e categorias que estiverem faltando, preservando seus registros atuais. Nesta versão, ele também prepara os campos persistentes usados pela central de faturas.
 
 ## Backup
 
