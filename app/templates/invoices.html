@@ -15,7 +15,6 @@
     {% if invoice.status == 'draft' %}
       <a href="{{ url_for('main.review_invoice',invoice_id=invoice.id) }}">Continuar revisão</a>
       <form method="post" action="{{ url_for('main.reprocess_invoice',invoice_id=invoice.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="text-button">Reprocessar</button></form>
-      <form method="post" action="{{ url_for('main.discard_invoice',invoice_id=invoice.id) }}" onsubmit="return confirm('Descartar esta fatura?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="text-button danger">Descartar</button></form>
     {% elif row.outstanding > 0 %}
       <details><summary>Registrar pagamento</summary><form method="post" action="{{ url_for('main.add_invoice_payment',invoice_id=invoice.id) }}" class="form-stack">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -26,6 +25,7 @@
         <button class="primary-button">Dar baixa</button>
       </form></details>
     {% endif %}
+    <form method="post" action="{{ url_for('main.delete_invoice_data',invoice_id=invoice.id) }}" onsubmit="return confirm('Excluir esta fatura, as compras importadas e os pagamentos vinculados? Esta ação não pode ser desfeita.')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="text-button danger">Excluir dados</button></form>
   </div></td>
 </tr>
 {% else %}<tr><td colspan="8" class="invoice-empty">Nenhuma fatura encontrada.</td></tr>{% endfor %}

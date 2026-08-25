@@ -502,6 +502,45 @@ def test_discard_pending_invoice_releases_drive_file(client, app):
         assert Invoice.query.filter_by(drive_file_id="drive-file-to-discard").count() == 0
 
 
+def test_delete_confirmed_invoice_removes_only_imported_data_and_releases_pdf(client, app):
+    login(client)
+    with app.app_context():
+        account = Account.query.first()
+        card = CreditCard.query.first()
+        manual = Transaction(description="Lançamento manual", amount=Decimal("12.00"), kind="expense", transaction_date=date(2026, 8, 1))
+        invoice = Invoice(card_id=card.id, reference_month="2026-08", total=Decimal("50.00"), status="confirmed", original_filename="itau.pdf", drive_file_id="drive-itau-delete")
+        db.session.add_all([manual, invoice]); db.session.flush()
+        item = InvoiceItem(invoice_id=invoice.id, purchase_date=date(2026, 7, 20), description="COMPRA ITAÚ", amount=Decimal("50.00"))
+        db.session.add(item); db.session.flush()
+        imported = Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=card.id, invoice_item_id=item.id, source="invoice", competence_month="2026-08")
+        payment = InvoicePayment(invoice_id=invoice.id, account_id=account.id, amount=Decimal("50.00"), payment_date=date(2026, 8, 10), paid_by="self")
+        db.session.add_all([imported, payment]); db.session.commit()
+        ids = (invoice.id, imported.id, manual.id)
+
+    response = client.post(f"/faturas/{ids[0]}/excluir", follow_redirects=True)
+    assert response.status_code == 200
+    assert "O PDF já pode ser importado novamente" in response.text
+    with app.app_context():
+        assert db.session.get(Invoice, ids[0]) is None
+        assert db.session.get(Transaction, ids[1]) is None
+        assert db.session.get(Transaction, ids[2]) is not None
+        assert InvoicePayment.query.count() == 0
+        replacement = Invoice(card_id=CreditCard.query.first().id, reference_month="2026-08", total=Decimal("0"), status="draft", drive_file_id="drive-itau-delete")
+        db.session.add(replacement); db.session.commit()
+
+
+def test_delete_invoice_is_blocked_for_closed_month(client, app):
+    login(client)
+    with app.app_context():
+        invoice = Invoice(card_id=CreditCard.query.first().id, reference_month="2026-08", total=Decimal("10.00"), status="confirmed")
+        close = MonthlyClose(reference_month="2026-08", income=Decimal("0"), expenses=Decimal("10"), balance=Decimal("-10"))
+        db.session.add_all([invoice, close]); db.session.commit(); invoice_id = invoice.id
+    response = client.post(f"/faturas/{invoice_id}/excluir", follow_redirects=True)
+    assert "Reabra o mês antes de excluir" in response.text
+    with app.app_context():
+        assert db.session.get(Invoice, invoice_id) is not None
+
+
 def test_reprocess_drive_draft_replaces_items(client, app, monkeypatch):
     login(client)
     with app.app_context():
