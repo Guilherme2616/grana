@@ -108,6 +108,9 @@ class Transaction(db.Model):
     installment_current = db.Column(db.Integer, nullable=True)
     installment_total = db.Column(db.Integer, nullable=True)
     recurring_id = db.Column(db.Integer, db.ForeignKey("recurring_transaction.id"), nullable=True)
+    competence_month = db.Column(db.String(7), nullable=True)
+    payment_responsibility = db.Column(db.String(20), default="self", nullable=False)
+    personal_amount = db.Column(db.Numeric(12, 2), nullable=True)
 
     account = db.relationship("Account", backref="transactions")
     category = db.relationship("Category", backref="transactions")
@@ -155,8 +158,24 @@ class InvoiceItem(db.Model):
     installment_total = db.Column(db.Integer, nullable=True)
     selected = db.Column(db.Boolean, default=True, nullable=False)
     category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
+    payment_responsibility = db.Column(db.String(20), default="self", nullable=False)
+    personal_amount = db.Column(db.Numeric(12, 2), nullable=True)
 
     category = db.relationship("Category")
+
+
+class InvoicePayment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    invoice_id = db.Column(db.Integer, db.ForeignKey("invoice.id"), nullable=False)
+    account_id = db.Column(db.Integer, db.ForeignKey("account.id"), nullable=True)
+    amount = db.Column(db.Numeric(12, 2), nullable=False)
+    payment_date = db.Column(db.Date, nullable=False, default=date.today)
+    paid_by = db.Column(db.String(20), default="self", nullable=False)
+    notes = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    invoice = db.relationship("Invoice", backref=db.backref("payments", cascade="all, delete-orphan"))
+    account = db.relationship("Account", backref="invoice_payments")
 
 
 class Investment(db.Model):

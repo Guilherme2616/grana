@@ -10,7 +10,7 @@ from flask_login import current_user, login_required, login_user, logout_user
 from sqlalchemy import extract, func
 
 from .extensions import db
-from .models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, Investment, Invoice, InvoiceItem, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
+from .models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
 from .services.drive_sync import (
     DriveAccessError,
     DriveConfigurationError,
@@ -42,6 +42,25 @@ PROVIDER_LABELS = dict(INVOICE_PROVIDERS)
 
 def money(value):
     return Decimal(str(value or 0)).quantize(Decimal("0.01"))
+
+
+def personal_value(item):
+    value = getattr(item, "personal_amount", None)
+    return money(item.amount if value is None else value)
+
+
+def responsibility_values(amount, responsibility, personal_amount=None):
+    if responsibility not in {"self", "parents", "shared"}:
+        raise ValueError
+    amount = money(amount)
+    if responsibility == "self":
+        return responsibility, amount
+    if responsibility == "parents":
+        return responsibility, Decimal("0.00")
+    value = money(personal_amount)
+    if value < 0 or value > amount:
+        raise ValueError
+    return responsibility, value
 
 
 def form_decimal(name, default="0"):
@@ -101,6 +120,22 @@ def upsert_card_cycle(card, reference_month, closing_date, due_date, source="man
     cycle.due_date = due_date
     cycle.source = source
     return cycle
+
+
+def card_competence_month(card, purchase_date):
+    cycle = (
+        CardCycle.query.filter(CardCycle.card_id == card.id, CardCycle.closing_date >= purchase_date)
+        .order_by(CardCycle.closing_date.asc()).first()
+    )
+    if cycle:
+        return cycle.reference_month
+    base_month = purchase_date.strftime("%Y-%m")
+    for offset in range(0, 3):
+        reference = shift_month(base_month, offset)
+        closing_date, _ = default_cycle_dates(card, reference)
+        if purchase_date <= closing_date:
+            return reference
+    return base_month
 
 
 def update_card_pdf_settings(card):
@@ -248,9 +283,12 @@ def investment_position():
 
 def cash_balance():
     initial = money(db.session.query(func.sum(Account.initial_balance)).filter(Account.active.is_(True)).scalar())
-    income = money(db.session.query(func.sum(Transaction.amount)).filter_by(kind="income").scalar())
-    expenses = money(db.session.query(func.sum(Transaction.amount)).filter_by(kind="expense").scalar())
-    return initial + income - expenses
+    account_rows = Transaction.query.filter(Transaction.card_id.is_(None)).all()
+    income = sum((money(item.amount) for item in account_rows if item.kind == "income"), Decimal("0"))
+    refunds = sum((money(item.amount) for item in account_rows if item.kind == "refund"), Decimal("0"))
+    expenses = sum((money(item.amount) for item in account_rows if item.kind == "expense"), Decimal("0"))
+    invoice_payments = sum((money(item.amount) for item in InvoicePayment.query.filter_by(paid_by="self").all()), Decimal("0"))
+    return initial + income + refunds - expenses - invoice_payments
 
 
 def future_invoice_rows(base_month, months=12):
@@ -339,13 +377,11 @@ def logout():
 @login_required
 def dashboard():
     today = date.today()
-    base = Transaction.query.filter(extract("month", Transaction.transaction_date) == today.month, extract("year", Transaction.transaction_date) == today.year)
-    income = money(base.filter_by(kind="income").with_entities(func.sum(Transaction.amount)).scalar())
-    expenses = money(base.filter_by(kind="expense").with_entities(func.sum(Transaction.amount)).scalar()) - money(base.filter_by(kind="refund").with_entities(func.sum(Transaction.amount)).scalar())
-    initial = money(db.session.query(func.sum(Account.initial_balance)).filter(Account.active.is_(True)).scalar())
-    all_income = money(db.session.query(func.sum(Transaction.amount)).filter_by(kind="income").scalar())
-    all_expenses = money(db.session.query(func.sum(Transaction.amount)).filter_by(kind="expense").scalar()) - money(db.session.query(func.sum(Transaction.amount)).filter_by(kind="refund").scalar())
-    balance = initial + all_income - all_expenses
+    reference_month = today.strftime("%Y-%m")
+    base = [item for item in Transaction.query.all() if (item.competence_month or item.transaction_date.strftime("%Y-%m")) == reference_month]
+    income = sum((money(item.amount) for item in base if item.kind == "income"), Decimal("0"))
+    expenses = sum((personal_value(item) for item in base if item.kind == "expense"), Decimal("0")) - sum((personal_value(item) for item in base if item.kind == "refund"), Decimal("0"))
+    balance = cash_balance()
     next_invoice = Invoice.query.filter_by(status="confirmed").order_by(Invoice.reference_month.desc()).first()
     transactions = Transaction.query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).limit(5).all()
     return render_template("dashboard.html", balance=balance, income=income, expenses=expenses, next_invoice=next_invoice, transactions=transactions, today=today)
@@ -364,12 +400,13 @@ def indicators():
     previous_month = shift_month(reference_month, -1)
     previous_start, previous_end = month_bounds(previous_month)
     filters = transaction_filters()
-    month_items = filter_transactions(Transaction.query.filter(Transaction.transaction_date.between(start, end)).all(), filters)
-    previous_items = filter_transactions(Transaction.query.filter(Transaction.transaction_date.between(previous_start, previous_end)).all(), filters)
+    all_transactions = Transaction.query.all()
+    month_items = filter_transactions([item for item in all_transactions if (item.competence_month or item.transaction_date.strftime("%Y-%m")) == reference_month], filters)
+    previous_items = filter_transactions([item for item in all_transactions if (item.competence_month or item.transaction_date.strftime("%Y-%m")) == previous_month], filters)
     income = sum((Decimal(item.amount) for item in month_items if item.kind == "income"), Decimal("0"))
-    expenses = sum((Decimal(item.amount) for item in month_items if item.kind == "expense"), Decimal("0")) - sum((Decimal(item.amount) for item in month_items if item.kind == "refund"), Decimal("0"))
+    expenses = sum((personal_value(item) for item in month_items if item.kind == "expense"), Decimal("0")) - sum((personal_value(item) for item in month_items if item.kind == "refund"), Decimal("0"))
     previous_income = sum((Decimal(item.amount) for item in previous_items if item.kind == "income"), Decimal("0"))
-    previous_expenses = sum((Decimal(item.amount) for item in previous_items if item.kind == "expense"), Decimal("0")) - sum((Decimal(item.amount) for item in previous_items if item.kind == "refund"), Decimal("0"))
+    previous_expenses = sum((personal_value(item) for item in previous_items if item.kind == "expense"), Decimal("0")) - sum((personal_value(item) for item in previous_items if item.kind == "refund"), Decimal("0"))
     net = income - expenses
     savings_rate = (net / income * Decimal("100")).quantize(Decimal("0.1")) if income else None
 
@@ -379,7 +416,8 @@ def indicators():
     daily_data = {day: Decimal("0") for day in range(1, end.day + 1)}
     expense_items = [item for item in month_items if item.kind == "expense"]
     for item in expense_items:
-        allocations = [(split.category, Decimal(split.amount)) for split in item.splits] or [(item.category, Decimal(item.amount))]
+        ratio = personal_value(item) / money(item.amount) if money(item.amount) else Decimal("0")
+        allocations = [(split.category, money(split.amount) * ratio) for split in item.splits] or [(item.category, personal_value(item))]
         for category, allocated_amount in allocations:
             category_name = category.full_name if category else "Sem categoria"
             category_color = category.color if category else "#8E8D8A"
@@ -387,11 +425,12 @@ def indicators():
             category_data[category_name]["amount"] += allocated_amount
         if item.card:
             card_data.setdefault(item.card.name, {"amount": Decimal("0"), "color": item.card.color})
-            card_data[item.card.name]["amount"] += Decimal(item.amount)
-            origin_data["Cartões"] += Decimal(item.amount)
+            card_data[item.card.name]["amount"] += personal_value(item)
+            origin_data["Cartões"] += personal_value(item)
         else:
-            origin_data["Contas e outros"] += Decimal(item.amount)
-        daily_data[item.transaction_date.day] += Decimal(item.amount)
+            origin_data["Contas e outros"] += personal_value(item)
+        if item.transaction_date.month == start.month:
+            daily_data[item.transaction_date.day] += personal_value(item)
 
     categories = sorted(({"name": name, **values} for name, values in category_data.items()), key=lambda row: row["amount"], reverse=True)
     cards = sorted(({"name": name, **values} for name, values in card_data.items()), key=lambda row: row["amount"], reverse=True)
@@ -399,11 +438,11 @@ def indicators():
     for offset in range(-5, 1):
         month = shift_month(reference_month, offset)
         trend_start, trend_end = month_bounds(month)
-        rows = filter_transactions(Transaction.query.filter(Transaction.transaction_date.between(trend_start, trend_end)).all(), filters)
+        rows = filter_transactions([item for item in all_transactions if (item.competence_month or item.transaction_date.strftime("%Y-%m")) == month], filters)
         trend.append({
             "label": month_label(month, short=True),
             "income": float(sum((Decimal(row.amount) for row in rows if row.kind == "income"), Decimal("0"))),
-            "expenses": float(sum((Decimal(row.amount) for row in rows if row.kind == "expense"), Decimal("0")) - sum((Decimal(row.amount) for row in rows if row.kind == "refund"), Decimal("0"))),
+            "expenses": float(sum((personal_value(row) for row in rows if row.kind == "expense"), Decimal("0")) - sum((personal_value(row) for row in rows if row.kind == "refund"), Decimal("0"))),
         })
 
     elapsed_days = end.day
@@ -495,11 +534,20 @@ def transactions():
             if month_is_closed(transaction_date):
                 flash("Este mês está fechado. Reabra-o antes de adicionar lançamentos.", "warning"); return redirect(url_for("main.transactions"))
             category_id = request.form.get("category_id") or automatic_category(request.form["description"], request.form["kind"])
+            amount = form_decimal("amount")
+            card = db.session.get(CreditCard, int(request.form["card_id"])) if request.form.get("card_id") else None
+            responsibility, personal_amount = responsibility_values(
+                amount,
+                request.form.get("payment_responsibility", "self"),
+                request.form.get("personal_amount", "0").replace(".", "").replace(",", "."),
+            )
             transaction = Transaction(
-                description=request.form["description"].strip(), amount=form_decimal("amount"),
+                description=request.form["description"].strip(), amount=amount,
                 kind=request.form["kind"], transaction_date=transaction_date,
                 account_id=request.form.get("account_id") or None, category_id=category_id,
-                card_id=request.form.get("card_id") or None, notes=request.form.get("notes", "").strip(),
+                card_id=card.id if card else None, notes=request.form.get("notes", "").strip(),
+                competence_month=card_competence_month(card, transaction_date) if card else transaction_date.strftime("%Y-%m"),
+                payment_responsibility=responsibility, personal_amount=personal_amount,
             )
             if not transaction.description or transaction.amount <= 0:
                 raise ValueError
@@ -532,7 +580,14 @@ def edit_transaction(item_id):
             item.transaction_date = datetime.strptime(request.form["transaction_date"], "%Y-%m-%d").date()
             item.category_id = request.form.get("category_id") or None
             item.account_id = request.form.get("account_id") or None
-            item.card_id = request.form.get("card_id") or None
+            card = db.session.get(CreditCard, int(request.form["card_id"])) if request.form.get("card_id") else None
+            item.card_id = card.id if card else None
+            item.competence_month = card_competence_month(card, item.transaction_date) if card else item.transaction_date.strftime("%Y-%m")
+            item.payment_responsibility, item.personal_amount = responsibility_values(
+                item.amount,
+                request.form.get("payment_responsibility", "self"),
+                request.form.get("personal_amount", "0").replace(".", "").replace(",", "."),
+            )
             item.notes = request.form.get("notes", "").strip()
             item.installment_current = int(request.form["installment_current"]) if request.form.get("installment_current") else None
             item.installment_total = int(request.form["installment_total"]) if request.form.get("installment_total") else None
@@ -775,14 +830,43 @@ def invoices():
     invoice_rows = []
     for invoice in query.order_by(Invoice.created_at.desc()).all():
         recognized = sum((Decimal(item.amount) for item in invoice.items if item.selected), Decimal("0"))
-        invoice_rows.append({"invoice":invoice,"recognized":recognized,"difference":Decimal(invoice.total or 0)-recognized})
+        personal_total = sum((money(item.amount if item.personal_amount is None else item.personal_amount) for item in invoice.items if item.selected), Decimal("0"))
+        paid = sum((money(payment.amount) for payment in invoice.payments), Decimal("0"))
+        invoice_rows.append({"invoice":invoice,"recognized":recognized,"difference":Decimal(invoice.total or 0)-recognized,"personal_total":personal_total,"paid":paid,"outstanding":max(Decimal(invoice.total or 0)-paid, Decimal("0"))})
     pending_count = Invoice.query.filter_by(status="draft").count()
     return render_template(
         "invoices.html",
         invoices=invoice_rows,
         current_status=status,
         pending_count=pending_count,
+        accounts=Account.query.filter_by(active=True).order_by(Account.name).all(),
     )
+
+
+@main.post("/faturas/<int:invoice_id>/pagamentos")
+@login_required
+def add_invoice_payment(invoice_id):
+    invoice = db.get_or_404(Invoice, invoice_id)
+    if invoice.status != "confirmed":
+        flash("Confirme a fatura antes de registrar pagamentos.", "warning")
+        return redirect(url_for("main.invoices"))
+    try:
+        amount = form_decimal("amount")
+        payment_date = datetime.strptime(request.form["payment_date"], "%Y-%m-%d").date()
+        paid_by = request.form.get("paid_by", "self")
+        account_id = request.form.get("account_id") or None
+        paid = sum((money(payment.amount) for payment in invoice.payments), Decimal("0"))
+        if paid_by not in {"self", "parents"} or amount <= 0 or paid + amount > money(invoice.total):
+            raise ValueError
+        if paid_by == "self" and not account_id:
+            raise ValueError
+        db.session.add(InvoicePayment(invoice_id=invoice.id, account_id=account_id if paid_by == "self" else None, amount=amount, payment_date=payment_date, paid_by=paid_by, notes=request.form.get("notes", "").strip()))
+        db.session.commit()
+        flash("Pagamento registrado como baixa da fatura, sem duplicar a despesa.", "success")
+    except (ValueError, InvalidOperation):
+        db.session.rollback()
+        flash("Confira o valor, a data e a conta do pagamento.", "danger")
+    return redirect(url_for("main.invoices", status="confirmed"))
 
 
 @main.post("/faturas/sincronizar-drive")
@@ -874,9 +958,16 @@ def review_invoice(invoice_id):
             try: item.amount = Decimal(request.form.get(f"amount_{item.id}", str(item.amount)).replace(".", "").replace(",", "."))
             except InvalidOperation: pass
             item.category_id = request.form.get(f"category_{item.id}") or automatic_category(item.description)
+            responsibility, personal_amount = responsibility_values(
+                item.amount,
+                request.form.get(f"responsibility_{item.id}", "self"),
+                request.form.get(f"personal_amount_{item.id}", "0").replace(".", "").replace(",", "."),
+            )
+            item.payment_responsibility = responsibility
+            item.personal_amount = personal_amount
             if item.selected:
                 total += item.amount
-                db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id, source="invoice", installment_current=item.installment_current, installment_total=item.installment_total))
+                db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id, source="invoice", installment_current=item.installment_current, installment_total=item.installment_total, competence_month=invoice.reference_month, payment_responsibility=responsibility, personal_amount=personal_amount))
         source = "pdf" if request.form.get("date_source") == "pdf" else "manual"
         upsert_card_cycle(invoice.card, invoice.reference_month, closing_date, due_date, source)
         official_total = invoice.statement_total
