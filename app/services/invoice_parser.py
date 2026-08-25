@@ -572,9 +572,10 @@ def parse_invoice_pdf(stream, reference_month, password=""):
         summary = parse_itau_summary(first_page, third_page, reference_month)
         due_date = summary["due_date"] or due_date
         resolved_reference = due_date.strftime("%Y-%m") if due_date else reference_month
-        # Os lançamentos atuais ocupam as páginas 2 e 3. Páginas posteriores
-        # descrevem parcelas futuras ou informações que não pertencem ao mês.
-        details_text = "\n".join(pages[1:3]) if len(pages) > 1 else text
+        # Faturas longas podem espalhar os lançamentos por quatro ou mais
+        # páginas. O próprio parser interrompe no total dos lançamentos atuais,
+        # antes da seção de parcelas futuras.
+        details_text = "\n".join(pages[1:]) if len(pages) > 1 else text
         items = parse_itau_text(details_text, resolved_reference)
         statement_total = summary["statement_total"]
         credit_limit = summary["credit_limit"]

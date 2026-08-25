@@ -29,6 +29,8 @@ with app.app_context():
         "invoice_item": {
             "installment_current": "ALTER TABLE invoice_item ADD COLUMN installment_current INTEGER",
             "installment_total": "ALTER TABLE invoice_item ADD COLUMN installment_total INTEGER",
+            "payment_responsibility": "ALTER TABLE invoice_item ADD COLUMN payment_responsibility VARCHAR(20) DEFAULT 'self' NOT NULL",
+            "personal_amount": "ALTER TABLE invoice_item ADD COLUMN personal_amount NUMERIC(12, 2)",
         },
         "category": {
             "parent_id": "ALTER TABLE category ADD COLUMN parent_id INTEGER REFERENCES category(id)",
@@ -45,6 +47,9 @@ with app.app_context():
             "installment_current": "ALTER TABLE \"transaction\" ADD COLUMN installment_current INTEGER",
             "installment_total": "ALTER TABLE \"transaction\" ADD COLUMN installment_total INTEGER",
             "recurring_id": "ALTER TABLE \"transaction\" ADD COLUMN recurring_id INTEGER REFERENCES recurring_transaction(id)",
+            "competence_month": "ALTER TABLE \"transaction\" ADD COLUMN competence_month VARCHAR(7)",
+            "payment_responsibility": "ALTER TABLE \"transaction\" ADD COLUMN payment_responsibility VARCHAR(20) DEFAULT 'self' NOT NULL",
+            "personal_amount": "ALTER TABLE \"transaction\" ADD COLUMN personal_amount NUMERIC(12, 2)",
         },
         "investment": {
             "fees": "ALTER TABLE investment ADD COLUMN fees NUMERIC(12, 2) DEFAULT 0 NOT NULL",

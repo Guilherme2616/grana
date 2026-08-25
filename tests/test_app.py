@@ -6,7 +6,7 @@ import pytest
 
 from app import create_app
 from app.extensions import db
-from app.models import Account, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, Investment, Invoice, InvoiceItem, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
+from app.models import Account, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
 from app.services.drive_sync import month_folder_matches, normalize_folder_name
 from app.services.financial_analytics import build_installment_projection, month_label, shift_month
 from app.services.invoice_parser import (
@@ -25,6 +25,7 @@ from app.services.invoice_parser import (
     parse_mercado_pago_text,
     parse_itau_summary,
     parse_itau_text,
+    parse_invoice_pdf,
 )
 from app.services.secret_store import decrypt_secret
 
@@ -74,6 +75,38 @@ def test_create_transaction(client, app):
     with app.app_context():
         assert Transaction.query.count() == 1
         assert Transaction.query.first().amount == Decimal("50.90")
+
+
+def test_card_competence_responsibility_and_invoice_payment_cash(client, app):
+    login(client)
+    with app.app_context():
+        account = Account.query.first()
+        card = CreditCard.query.first()
+        ids = (account.id, card.id)
+    response = client.post("/movimentacoes", data={
+        "description": "Compra dos pais", "amount": "100,00", "kind": "expense",
+        "transaction_date": "2026-08-25", "card_id": ids[1],
+        "payment_responsibility": "parents",
+    }, follow_redirects=True)
+    assert response.status_code == 200
+    with app.app_context():
+        transaction = Transaction.query.filter_by(description="Compra dos pais").one()
+        assert transaction.competence_month == "2026-09"
+        assert transaction.personal_amount == Decimal("0.00")
+        invoice = Invoice(card_id=ids[1], reference_month="2026-09", total=Decimal("100.00"), status="confirmed", original_filename="setembro.pdf")
+        db.session.add(invoice); db.session.commit(); invoice_id = invoice.id
+
+    client.post(f"/faturas/{invoice_id}/pagamentos", data={
+        "amount": "60,00", "payment_date": "2026-09-28", "paid_by": "self", "account_id": ids[0],
+    }, follow_redirects=True)
+    client.post(f"/faturas/{invoice_id}/pagamentos", data={
+        "amount": "40,00", "payment_date": "2026-09-28", "paid_by": "parents",
+    }, follow_redirects=True)
+    with app.app_context():
+        payments = InvoicePayment.query.order_by(InvoicePayment.id).all()
+        assert [(item.paid_by, item.amount) for item in payments] == [("self", Decimal("60.00")), ("parents", Decimal("40.00"))]
+        from app.routes import cash_balance
+        assert cash_balance() == Decimal("40.00")
 
 
 def test_category_hierarchy_rule_edit_and_safe_delete(client, app):
@@ -335,6 +368,28 @@ def test_itau_adapter_reads_side_by_side_rows_and_reconciles_totals():
     assert items[0]["installment_total"] == 10
     assert all("Pagamento" not in item["description"] for item in items)
     assert all("10/10" not in item["description"] for item in items)
+
+
+def test_itau_pdf_reads_current_purchases_beyond_third_page(monkeypatch):
+    pages = [
+        """Itaú Personnalité\nO total da sua fatura é: R$ 60,00\nVencimento 10/08/2026\nLimite total de crédito R$ 15.000,00""",
+        """LANÇAMENTOS: COMPRAS E SAQUES\n01/07 COMPRA PAGINA DOIS 10,00""",
+        """02/07 COMPRA PAGINA TRES 20,00""",
+        """03/07 COMPRA PAGINA QUATRO 30,00\nTotal dos lançamentos atuais 60,00\nCompras parceladas - próximas faturas""",
+    ]
+
+    class FakeReader:
+        is_encrypted = False
+        def __init__(self, stream):
+            self.pages = []
+
+    monkeypatch.setattr("app.services.invoice_parser.PdfReader", FakeReader)
+    monkeypatch.setattr("app.services.invoice_parser.extract_pdf_pages", lambda reader: pages)
+    parsed = parse_invoice_pdf(BytesIO(b"pdf"), "2026-08")
+    assert parsed["adapter"] == "itau"
+    assert [item["description"] for item in parsed["items"]] == [
+        "COMPRA PAGINA DOIS", "COMPRA PAGINA TRES", "COMPRA PAGINA QUATRO"
+    ]
 
 
 def test_drive_folder_names_and_encrypted_card_password(client, app):

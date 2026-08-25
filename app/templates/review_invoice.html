@@ -28,7 +28,7 @@
     <label>Data de vencimento <span class="source-chip">{{ 'Encontrada no PDF' if suggestion.source == 'pdf' else 'Padrão do cartão' }}</span><input type="date" name="due_date" value="{{ suggestion.due_date }}" required></label>
   </section>
   <section class="panel table-panel"><div class="table-wrap"><table>
-    <thead><tr><th>Importar</th><th>Data</th><th>Descrição</th><th>Parcelas</th><th>Categoria</th><th>Valor</th></tr></thead>
+    <thead><tr><th>Importar</th><th>Data</th><th>Descrição</th><th>Parcelas</th><th>Categoria</th><th>Quem paga?</th><th>Minha parte</th><th>Valor</th></tr></thead>
     <tbody>
     {% for item in invoice.items %}
       <tr>
@@ -37,6 +37,8 @@
         <td><input name="description_{{ item.id }}" value="{{ item.description }}" required></td>
         <td>{% if item.installment_total %}<span class="installment-chip">{{ item.installment_current }}/{{ item.installment_total }}</span>{% else %}—{% endif %}</td>
         <td><select name="category_{{ item.id }}"><option value="">Sem categoria</option>{% for category in categories %}<option value="{{ category.id }}" {{ 'selected' if item.category_id == category.id }}>{{ category.full_name }}</option>{% endfor %}</select></td>
+        <td><select name="responsibility_{{ item.id }}" class="responsibility-select" data-item="{{ item.id }}"><option value="self">Eu</option><option value="parents">Meus pais</option><option value="shared">Dividido</option></select></td>
+        <td><input class="amount-input personal-amount" data-item="{{ item.id }}" name="personal_amount_{{ item.id }}" value="{{ '%.2f'|format(item.amount)|replace('.', ',') }}" disabled></td>
         <td><input class="amount-input" name="amount_{{ item.id }}" value="{{ '%.2f'|format(item.amount)|replace('.', ',') }}"></td>
       </tr>
     {% endfor %}
@@ -44,4 +46,7 @@
   </table></div></section>
   <div class="sticky-actions"><a href="{{ url_for('main.import_invoice') }}">Cancelar</a><button class="primary-button">Confirmar compras e datas →</button></div>
 </form>
+<script>
+(()=>{document.querySelectorAll('.responsibility-select').forEach(select=>{const input=document.querySelector('.personal-amount[data-item="'+select.dataset.item+'"]');const sync=()=>{input.disabled=select.value!=='shared';if(select.value==='parents')input.value='0,00'};select.addEventListener('change',sync);sync()})})();
+</script>
 {% endblock %}
