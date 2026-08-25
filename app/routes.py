@@ -994,6 +994,35 @@ def discard_invoice(invoice_id):
     return redirect(url_for("main.invoices", status="draft"))
 
 
+@main.post("/faturas/<int:invoice_id>/excluir")
+@login_required
+def delete_invoice_data(invoice_id):
+    invoice = db.get_or_404(Invoice, invoice_id)
+    if MonthlyClose.query.filter_by(reference_month=invoice.reference_month).first():
+        flash("A competência desta fatura está fechada. Reabra o mês antes de excluir os dados.", "warning")
+        return redirect(url_for("main.invoices"))
+
+    filename = invoice.original_filename or f"Fatura {invoice.reference_month}"
+    item_ids = [item.id for item in invoice.items]
+    imported_transactions = Transaction.query.filter(
+        Transaction.invoice_item_id.in_(item_ids)
+    ).all() if item_ids else []
+    payment_count = len(invoice.payments)
+
+    for transaction in imported_transactions:
+        db.session.delete(transaction)
+    db.session.flush()
+    session.pop(f"invoice_cycle_{invoice.id}", None)
+    db.session.delete(invoice)
+    db.session.commit()
+
+    flash(
+        f"{filename} excluída: {len(imported_transactions)} compras e {payment_count} pagamentos removidos. O PDF já pode ser importado novamente.",
+        "success",
+    )
+    return redirect(url_for("main.invoices"))
+
+
 @main.route("/recorrencias", methods=["GET", "POST"])
 @login_required
 def recurring_transactions():
