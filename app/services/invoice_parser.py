@@ -504,11 +504,13 @@ def parse_itau_text(text, reference_month):
 
     section = text[section_match.end():]
     items = []
+    column_items = [[], []]
     seen = set()
     pending_date = None
     pending_parts = []
+    pending_column = 0
 
-    def append_segment(row_date, remainder):
+    def append_segment(row_date, remainder, column=0):
         # No PDF real do Itaú, a compra da coluna esquerda termina no valor,
         # mas a mesma linha continua com categoria/cidade. Por isso o valor não
         # pode ser obrigado a estar no fim da linha. A primeira quantia depois
@@ -519,6 +521,7 @@ def parse_itau_text(text, reference_month):
             return False
         description = remainder[:amount_match.start()].strip()
         installment_match = SLASH_INSTALLMENT_PATTERN.search(description) or INSTALLMENT_PATTERN.search(description)
+        previous_count = len(items)
         _append_item(
             items,
             seen,
@@ -529,6 +532,8 @@ def parse_itau_text(text, reference_month):
             int(installment_match.group("current")) if installment_match else None,
             int(installment_match.group("total")) if installment_match else None,
         )
+        if len(items) > previous_count:
+            column_items[column].append(items.pop())
         return True
 
     def row_date_matches(raw_line):
@@ -563,7 +568,7 @@ def parse_itau_text(text, reference_month):
         if not date_matches:
             if pending_date:
                 pending_parts.append(normalized_line)
-                if append_segment(pending_date, " ".join(pending_parts)):
+                if append_segment(pending_date, " ".join(pending_parts), pending_column):
                     pending_date = None
                     pending_parts = []
             continue
@@ -576,9 +581,16 @@ def parse_itau_text(text, reference_month):
             segment = " ".join(raw_line[start:end].split()).strip()
             row_date = date_match.group("date")
             remainder = segment[len(row_date):].strip()
-            if not append_segment(row_date, remainder) and len(date_matches) == 1:
+            column = 0 if date_match.start() == 0 else 1
+            if not append_segment(row_date, remainder, column) and len(date_matches) == 1:
                 pending_date = row_date
                 pending_parts = [remainder]
+                pending_column = column
+
+    # O Itaú imprime duas colunas independentes. A revisão deve seguir a ordem
+    # visual da fatura: de cima a baixo na esquerda e, depois, na direita.
+    items.extend(column_items[0])
+    items.extend(column_items[1])
 
     fees_match = ITAU_FEES_SECTION_PATTERN.search(text)
     if fees_match:
