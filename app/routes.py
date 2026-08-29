@@ -1,6 +1,7 @@
 import calendar
 import csv
 import json
+import unicodedata
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
@@ -56,6 +57,24 @@ def invoice_provider_hint(card):
         return "mercado_pago"
     if "inter" in identity:
         return "banco_inter"
+    return ""
+
+
+def invoice_filename_provider_hint(filename, cards):
+    normalized = unicodedata.normalize("NFKD", filename or "").encode("ascii", "ignore").decode().lower()
+    markers = (
+        ("bb_smiles", ("smiles", "ourocard", "banco do brasil")),
+        ("itau", ("itau",)),
+        ("mercado_pago", ("mercado pago",)),
+        ("banco_inter", ("banco inter", "inter")),
+    )
+    for provider, values in markers:
+        if any(value in normalized for value in values):
+            return provider
+    for card in cards:
+        card_name = unicodedata.normalize("NFKD", card.name or "").encode("ascii", "ignore").decode().lower().strip()
+        if card_name and card_name in normalized:
+            return invoice_provider_hint(card)
     return ""
 
 
@@ -231,7 +250,7 @@ def replace_invoice_draft(invoice, parsed):
     invoice.date_source = "pdf" if parsed.get("due_date") else "default"
 
 
-def parse_with_saved_passwords(stream_factory, reference_month, cards):
+def parse_with_saved_passwords(stream_factory, reference_month, cards, expected_provider=""):
     passwords = [""]
     for card in cards:
         password = decrypt_secret(card.pdf_password_encrypted)
@@ -241,7 +260,7 @@ def parse_with_saved_passwords(stream_factory, reference_month, cards):
     password_error = None
     for password in passwords:
         try:
-            return parse_invoice_pdf(stream_factory(), reference_month, password)
+            return parse_invoice_pdf(stream_factory(), reference_month, password, expected_provider)
         except (PdfPasswordRequired, PdfPasswordInvalid) as exc:
             password_error = exc
     if password_error:
@@ -941,7 +960,12 @@ def sync_drive_invoices():
             continue
         try:
             downloaded = download_pdf(drive_session, drive_file["id"]).getvalue()
-            parsed = parse_with_saved_passwords(lambda data=downloaded: BytesIO(data), reference_month, cards)
+            parsed = parse_with_saved_passwords(
+                lambda data=downloaded: BytesIO(data),
+                reference_month,
+                cards,
+                invoice_filename_provider_hint(filename, cards),
+            )
             if not parsed["items"]:
                 raise ValueError("Nenhuma compra foi encontrada.")
             adapter = parsed.get("adapter", "generic")
@@ -1289,7 +1313,10 @@ def reprocess_invoice(invoice_id):
             raise DriveAccessError("O PDF não está mais na pasta desse mês no Google Drive.")
         downloaded = download_pdf(drive_session, invoice.drive_file_id).getvalue()
         parsed = parse_with_saved_passwords(
-            lambda data=downloaded: BytesIO(data), invoice.reference_month, cards
+            lambda data=downloaded: BytesIO(data),
+            invoice.reference_month,
+            cards,
+            invoice_provider_hint(invoice.card),
         )
         if not parsed["items"]:
             raise ValueError("Nenhuma compra foi encontrada no novo processamento.")
