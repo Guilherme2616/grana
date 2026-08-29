@@ -1,8 +1,12 @@
 import re
+import shutil
+import subprocess
+import tempfile
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 
 DATE_PATTERN = re.compile(r"(?P<date>\d{2}/\d{2}(?:/\d{2,4})?)")
@@ -338,6 +342,14 @@ def parse_bb_smiles_text(text, reference_month):
         if amount_matches:
             amount_match = amount_matches[-1]
             description = combined[:amount_match.start()]
+            normalized_description = re.sub(r"[^a-z0-9]+", " ", description.lower()).strip()
+            # Em PDFs digitalizados o sinal negativo do pagamento pode não ser
+            # reconhecido pelo OCR. A descrição ainda permite descartá-lo com
+            # segurança antes de criar uma compra falsa.
+            if normalized_description.startswith(("pgto ", "pagamento ", "pag fatura ")):
+                pending_date = None
+                pending_parts = []
+                continue
             installment_match = SLASH_INSTALLMENT_PATTERN.search(description)
             _append_item(
                 items,
@@ -497,10 +509,14 @@ def parse_itau_text(text, reference_month):
     pending_parts = []
 
     def append_segment(row_date, remainder):
-        amount_matches = list(AMOUNT_PATTERN.finditer(remainder))
-        if not amount_matches:
+        # No PDF real do Itaú, a compra da coluna esquerda termina no valor,
+        # mas a mesma linha continua com categoria/cidade. Por isso o valor não
+        # pode ser obrigado a estar no fim da linha. A primeira quantia depois
+        # da descrição é o valor da compra; tokens como 09/10 não têm vírgula e
+        # não são confundidos com dinheiro.
+        amount_match = BB_ANY_AMOUNT_PATTERN.search(remainder)
+        if not amount_match:
             return False
-        amount_match = amount_matches[-1]
         description = remainder[:amount_match.start()].strip()
         installment_match = SLASH_INSTALLMENT_PATTERN.search(description) or INSTALLMENT_PATTERN.search(description)
         _append_item(
@@ -623,6 +639,53 @@ def extract_pdf_pages(reader):
     return pages
 
 
+def ocr_pdf_pages(reader):
+    """Renderiza e reconhece PDFs digitalizados que não possuem camada de texto."""
+    if not shutil.which("pdftoppm") or not shutil.which("tesseract"):
+        return []
+    try:
+        from PIL import Image, ImageOps
+        import pytesseract
+    except ImportError:
+        return []
+
+    with tempfile.TemporaryDirectory(prefix="grana-invoice-") as directory:
+        temporary = Path(directory)
+        decrypted_pdf = temporary / "invoice.pdf"
+        writer = PdfWriter()
+        writer.clone_document_from_reader(reader)
+        with decrypted_pdf.open("wb") as output:
+            writer.write(output)
+
+        prefix = temporary / "page"
+        try:
+            subprocess.run(
+                ["pdftoppm", "-png", "-gray", "-r", "160", str(decrypted_pdf), str(prefix)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=45,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+
+        pages = []
+        for image_path in sorted(temporary.glob("page-*.png")):
+            try:
+                with Image.open(image_path) as image:
+                    prepared = ImageOps.autocontrast(image.convert("L"))
+                    pages.append(
+                        pytesseract.image_to_string(
+                            prepared,
+                            config="--psm 6",
+                            timeout=30,
+                        )
+                    )
+            except (OSError, RuntimeError):
+                pages.append("")
+        return pages
+
+
 def parse_invoice_pdf(stream, reference_month, password="", expected_provider=""):
     reader = PdfReader(stream)
     if reader.is_encrypted:
@@ -632,6 +695,11 @@ def parse_invoice_pdf(stream, reference_month, password="", expected_provider=""
             raise PdfPasswordInvalid("A senha informada não desbloqueou o PDF.")
 
     pages = extract_pdf_pages(reader)
+    # A fatura BB Smiles enviada pelo usuário é inteiramente digitalizada: o
+    # pypdf abre o documento, mas todas as páginas retornam texto vazio. Nesse
+    # caso, renderiza a página completa e aplica OCR antes de escolher o leitor.
+    if expected_provider == "bb_smiles" and not any(page.strip() for page in pages):
+        pages = ocr_pdf_pages(reader)
     text = "\n".join(pages)
     due_date = detect_due_date(text, reference_month)
     resolved_reference = due_date.strftime("%Y-%m") if due_date else reference_month
