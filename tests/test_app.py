@@ -453,6 +453,19 @@ def test_itau_adapter_reads_left_column_when_category_follows_amount():
     assert sum(item["amount"] for item in items) == Decimal("455.52")
 
 
+def test_itau_adapter_keeps_indented_right_column_after_left_column():
+    details = (
+        "LANÇAMENTOS: COMPRAS E SAQUES\n"
+        " 28/11 GRUPO CASAS BAHIA 09/10 309,89 supermercado ADAMANTINA\n"
+        + (" " * 140) + "05/07 LUANA BEATRIZ GERALDOAD 6,00\n"
+        "Total dos lançamentos atuais 315,89\n"
+    )
+    items = parse_itau_text(details, "2026-08")
+    assert [item["description"] for item in items] == [
+        "GRUPO CASAS BAHIA 09/10", "LUANA BEATRIZ GERALDOAD",
+    ]
+
+
 def test_itau_screenshot_values_reconcile_purchases_products_and_fees():
     purchase_amounts = """
     28/11 GRUPO CASAS B 09/10 309,89
