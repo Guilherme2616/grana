@@ -243,6 +243,33 @@ def test_bb_smiles_adapter_accepts_alternate_heading_and_country_after_amount():
     assert sum(item["amount"] for item in items) == Decimal("108.90")
 
 
+def test_bb_adapter_accepts_ourocard_without_smiles_wrapped_rows_and_foreign_amount():
+    extracted_text = """
+    Ourocard Visa Infinite
+    Banco do Brasil
+    Total da fatura
+    1.284,56
+    Data de vencimento 16/06/2025
+
+    Compras na fatura
+    Data Descrição País Valor
+    02/05 AMAZON AWS SERVICOS
+    SAO PAULO BR 184,56
+    04/05 COMPRA INTERNACIONAL USD 20,00 US R$ 100,00
+    Data Descrição País Valor
+    06/05 LOJA BRASILEIRA BR 1.000,00
+    Total da fatura R$ 1.284,56
+    Compras parceladas próximas faturas
+    07/05 NAO IMPORTAR BR 50,00
+    """
+    assert is_bb_smiles_invoice(extracted_text)
+    assert detect_bb_statement_total(extracted_text) == Decimal("1284.56")
+    items = parse_bb_smiles_text(extracted_text, "2025-06")
+    assert [item["amount"] for item in items] == [Decimal("184.56"), Decimal("100.00"), Decimal("1000.00")]
+    assert items[0]["description"] == "AMAZON AWS SERVICOS SAO PAULO"
+    assert all("NAO IMPORTAR" not in item["description"] for item in items)
+
+
 def test_mercado_pago_adapter_ignores_payments_and_reads_installments():
     cover = """
     mercado pago
@@ -368,6 +395,28 @@ def test_itau_adapter_reads_side_by_side_rows_and_reconciles_totals():
     assert items[0]["installment_total"] == 10
     assert all("Pagamento" not in item["description"] for item in items)
     assert all("10/10" not in item["description"] for item in items)
+
+
+def test_itau_adapter_keeps_old_purchases_installments_and_wrapped_rows():
+    details = """
+    LANÇAMENTOS DO CARTÃO
+    DATA ESTABELECIMENTO VALOR EM R$
+       18/02 NOTEBOOK LOJA XPTO PARC 07/12 299,90
+     03/07 COMPRA DO MES 45,10
+    21/11 CURSO ONLINE PARCELA 09 DE 10
+    SAO PAULO 120,00
+    Total dos lançamentos atuais 465,00
+    Compras parceladas - próximas faturas
+    18/02 NOTEBOOK LOJA XPTO PARC 08/12 299,90
+    """
+    items = parse_itau_text(details, "2026-08")
+    assert [item["amount"] for item in items] == [Decimal("299.90"), Decimal("45.10"), Decimal("120.00")]
+    assert items[0]["purchase_date"] == date(2026, 2, 18)
+    assert items[0]["installment_current"] == 7
+    assert items[0]["installment_total"] == 12
+    assert items[2]["installment_current"] == 9
+    assert items[2]["installment_total"] == 10
+    assert all("08/12" not in item["description"] for item in items)
 
 
 def test_itau_pdf_reads_current_purchases_beyond_third_page(monkeypatch):
@@ -539,6 +588,30 @@ def test_delete_invoice_is_blocked_for_closed_month(client, app):
     assert "Reabra o mês antes de excluir" in response.text
     with app.app_context():
         assert db.session.get(Invoice, invoice_id) is not None
+
+
+def test_edit_invoice_total_preserves_items_and_rejects_value_below_payments(client, app):
+    login(client)
+    with app.app_context():
+        account = Account.query.first()
+        invoice = Invoice(card_id=CreditCard.query.first().id, reference_month="2026-08", total=Decimal("100.00"), statement_total=Decimal("100.00"), status="confirmed")
+        db.session.add(invoice); db.session.flush()
+        item = InvoiceItem(invoice_id=invoice.id, purchase_date=date(2026, 8, 1), description="COMPRA", amount=Decimal("80.00"))
+        payment = InvoicePayment(invoice_id=invoice.id, account_id=account.id, amount=Decimal("60.00"), payment_date=date(2026, 8, 10), paid_by="self")
+        db.session.add_all([item, payment]); db.session.commit(); invoice_id = invoice.id
+
+    response = client.post(f"/faturas/{invoice_id}/total", data={"total": "120,50"}, follow_redirects=True)
+    assert "Total da fatura atualizado" in response.text
+    with app.app_context():
+        invoice = db.session.get(Invoice, invoice_id)
+        assert invoice.total == Decimal("120.50")
+        assert invoice.statement_total == Decimal("120.50")
+        assert len(invoice.items) == 1
+
+    response = client.post(f"/faturas/{invoice_id}/total", data={"total": "50,00"}, follow_redirects=True)
+    assert "igual ou maior que o valor já pago" in response.text
+    with app.app_context():
+        assert db.session.get(Invoice, invoice_id).total == Decimal("120.50")
 
 
 def test_reprocess_drive_draft_replaces_items(client, app, monkeypatch):
