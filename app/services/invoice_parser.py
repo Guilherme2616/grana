@@ -539,10 +539,10 @@ def parse_itau_text(text, reference_month):
     def row_date_matches(raw_line):
         matches = []
         for match in ITAU_DATE_TOKEN_PATTERN.finditer(raw_line):
-            if match.start() == 0:
+            prefix = raw_line[:match.start()]
+            if not prefix.strip():
                 matches.append(match)
                 continue
-            prefix = raw_line[:match.start()]
             if not re.search(r"\s{2,}$", prefix):
                 continue
             trailing = raw_line[match.end():].lstrip()
@@ -555,7 +555,6 @@ def parse_itau_text(text, reference_month):
         return matches
 
     for raw_line in section.splitlines():
-        raw_line = raw_line.lstrip()
         normalized_line = " ".join(raw_line.split()).strip()
         if not normalized_line:
             continue
@@ -581,7 +580,10 @@ def parse_itau_text(text, reference_month):
             segment = " ".join(raw_line[start:end].split()).strip()
             row_date = date_match.group("date")
             remainder = segment[len(row_date):].strip()
-            column = 0 if date_match.start() == 0 else 1
+            # A coluna direita começa bem depois da margem da esquerda. Não
+            # removemos a indentação original porque ela é a única pista em
+            # linhas que contêm apenas uma compra da coluna direita.
+            column = 0 if date_match.start() < 100 else 1
             if not append_segment(row_date, remainder, column) and len(date_matches) == 1:
                 pending_date = row_date
                 pending_parts = [remainder]
