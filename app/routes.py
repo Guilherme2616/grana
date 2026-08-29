@@ -804,10 +804,15 @@ def import_invoice():
         try:
             reference_month = request.form["reference_month"]
             datetime.strptime(reference_month, "%Y-%m")
-            parsed = parse_invoice_pdf(file.stream, reference_month, request.form.get("pdf_password", ""))
+            card = db.get_or_404(CreditCard, int(request.form["card_id"]))
+            parsed = parse_invoice_pdf(
+                file.stream,
+                reference_month,
+                request.form.get("pdf_password", ""),
+                card.invoice_provider,
+            )
             if not parsed["items"]:
                 flash("Não consegui localizar compras automaticamente nesse PDF.", "warning"); return render_template("import_invoice.html", cards=cards, drive_configured=drive_is_configured())
-            card = db.get_or_404(CreditCard, int(request.form["card_id"]))
             invoice = create_invoice_draft(card, parsed, file.filename)
             db.session.commit()
             return redirect(url_for("main.review_invoice", invoice_id=invoice.id))
