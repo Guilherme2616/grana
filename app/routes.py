@@ -44,6 +44,21 @@ def money(value):
     return Decimal(str(value or 0)).quantize(Decimal("0.01"))
 
 
+def invoice_provider_hint(card):
+    if card.invoice_provider:
+        return card.invoice_provider
+    identity = f"{card.name} {card.institution}".lower()
+    if any(marker in identity for marker in ("banco do brasil", "ourocard", "smiles")):
+        return "bb_smiles"
+    if "itaú" in identity or "itau" in identity:
+        return "itau"
+    if "mercado pago" in identity:
+        return "mercado_pago"
+    if "inter" in identity:
+        return "banco_inter"
+    return ""
+
+
 def personal_value(item):
     value = getattr(item, "personal_amount", None)
     return money(item.amount if value is None else value)
@@ -809,7 +824,7 @@ def import_invoice():
                 file.stream,
                 reference_month,
                 request.form.get("pdf_password", ""),
-                card.invoice_provider,
+                invoice_provider_hint(card),
             )
             if not parsed["items"]:
                 flash("Não consegui localizar compras automaticamente nesse PDF.", "warning"); return render_template("import_invoice.html", cards=cards, drive_configured=drive_is_configured())
