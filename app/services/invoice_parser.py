@@ -288,10 +288,16 @@ def parse_bb_smiles_text(text, reference_month):
     section_match = BB_SECTION_PATTERN.search(text)
     if not section_match:
         section_match = BB_TABLE_HEADER_PATTERN.search(text)
-    if not section_match:
-        return []
-
-    section = text[section_match.end():]
+    if section_match:
+        section = text[section_match.end():]
+    else:
+        # Alguns PDFs do BB desenham o título e o cabeçalho como imagem, mas
+        # mantêm as linhas da tabela como texto. Nesse caso, começa na primeira
+        # linha datada; pagamentos negativos continuam sendo descartados.
+        first_row = re.search(r"(?m)^\s*\d{2}/\d{2}(?:/\d{2,4})?\s+", text)
+        if not first_row:
+            return []
+        section = text[first_row.start():]
     items = []
     seen = set()
     pending_date = None
