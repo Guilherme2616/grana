@@ -57,7 +57,7 @@ ITAU_FEE_PATTERN = re.compile(
     rf".*?(?P<amount>{AMOUNT_TEXT})\s*$",
     re.IGNORECASE,
 )
-ITAU_ROW_DATE_PATTERN = re.compile(r"(?:^|\s{2,})(?P<date>\d{2}/\d{2})(?=\s+)")
+ITAU_DATE_TOKEN_PATTERN = re.compile(r"(?P<date>\d{2}/\d{2})(?=\s+)")
 
 
 class PdfPasswordRequired(ValueError):
@@ -88,7 +88,10 @@ def parse_date(value, reference_month):
             pass
     day, month = [int(part) for part in value.split("/")]
     year = month_year.year
-    if month > month_year.month + 6:
+    # A fatura nunca contém uma compra futura. Se o mês impresso é posterior
+    # ao mês da fatura, a compra pertence ao ano anterior (ex.: 28/11 em uma
+    # fatura com vencimento em agosto do ano seguinte).
+    if month > month_year.month:
         year -= 1
     return date(year, month, day)
 
@@ -512,6 +515,24 @@ def parse_itau_text(text, reference_month):
         )
         return True
 
+    def row_date_matches(raw_line):
+        matches = []
+        for match in ITAU_DATE_TOKEN_PATTERN.finditer(raw_line):
+            if match.start() == 0:
+                matches.append(match)
+                continue
+            prefix = raw_line[:match.start()]
+            if not re.search(r"\s{2,}$", prefix):
+                continue
+            trailing = raw_line[match.end():].lstrip()
+            # Em PDFs com colunas bem espaçadas, 09/10 de uma parcela pode
+            # parecer uma segunda data. Uma data de linha é seguida pelo nome
+            # do estabelecimento; a parcela é seguida diretamente pelo valor.
+            if re.match(rf"(?:R\$\s*)?{AMOUNT_TEXT}(?:\s|$)", trailing, re.IGNORECASE):
+                continue
+            matches.append(match)
+        return matches
+
     for raw_line in section.splitlines():
         raw_line = raw_line.lstrip()
         normalized_line = " ".join(raw_line.split()).strip()
@@ -522,7 +543,7 @@ def parse_itau_text(text, reference_month):
 
         # A página 2 possui duas tabelas lado a lado. Os espaços preservados pelo
         # modo layout permitem separar duas compras que estejam na mesma linha.
-        date_matches = list(ITAU_ROW_DATE_PATTERN.finditer(raw_line))
+        date_matches = row_date_matches(raw_line)
         if not date_matches:
             if pending_date:
                 pending_parts.append(normalized_line)
