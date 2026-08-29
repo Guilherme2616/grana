@@ -179,6 +179,7 @@ def test_money_and_date_parser():
     assert parse_brl("R$ 1.234,56") == Decimal("1234.56")
     assert parse_brl("R$ 661,26-") == Decimal("-661.26")
     assert parse_date("15/07", "2026-08") == date(2026, 7, 15)
+    assert parse_date("28/11", "2026-08") == date(2025, 11, 28)
     assert detect_due_date("Data de vencimento: 28/08/2026", "2026-08") == date(2026, 8, 28)
     assert detect_due_date("Vencimento\n10/08/2026", "2026-08") == date(2026, 8, 10)
 
@@ -419,6 +420,22 @@ def test_itau_adapter_keeps_old_purchases_installments_and_wrapped_rows():
     assert all("08/12" not in item["description"] for item in items)
 
 
+def test_itau_adapter_does_not_treat_spaced_installment_as_a_second_date():
+    details = """
+    LANÇAMENTOS: COMPRAS E SAQUES
+    28/11 GRUPO CASAS BAHIA        09/10       309,89        05/07 ILUANA BEATRIZ GERALDOAD 38,13
+    23/02 IEV ADAMANTINA           06/10        57,50        07/07 AUTO POSTO CARREIROADAM 50,00
+    Total dos lançamentos atuais 455,52
+    """
+    items = parse_itau_text(details, "2026-08")
+    assert [item["description"] for item in items] == [
+        "GRUPO CASAS BAHIA 09/10", "ILUANA BEATRIZ GERALDOAD",
+        "IEV ADAMANTINA 06/10", "AUTO POSTO CARREIROADAM",
+    ]
+    assert sum(item["amount"] for item in items) == Decimal("455.52")
+    assert items[0]["purchase_date"] == date(2025, 11, 28)
+
+
 def test_itau_screenshot_values_reconcile_purchases_products_and_fees():
     purchase_amounts = """
     28/11 GRUPO CASAS B 09/10 309,89
@@ -603,7 +620,7 @@ def test_drive_sync_creates_draft_and_recovers_pending_review(client, app, monke
     }
     monkeypatch.setattr("app.routes.list_month_pdfs", lambda month: (object(), [fake_file]))
     monkeypatch.setattr("app.routes.download_pdf", lambda drive_session, file_id: BytesIO(b"pdf"))
-    monkeypatch.setattr("app.routes.parse_with_saved_passwords", lambda factory, month, cards: parsed)
+    monkeypatch.setattr("app.routes.parse_with_saved_passwords", lambda factory, month, cards, expected_provider="": parsed)
 
     response = client.post("/faturas/sincronizar-drive", data={"reference_month": "2026-08"})
     assert response.status_code == 200
@@ -770,7 +787,7 @@ def test_reprocess_drive_draft_replaces_items(client, app, monkeypatch):
         lambda month: (object(), [{"id": "drive-file-reprocess", "name": "BB Smiles.pdf"}]),
     )
     monkeypatch.setattr("app.routes.download_pdf", lambda drive_session, file_id: BytesIO(b"pdf"))
-    monkeypatch.setattr("app.routes.parse_with_saved_passwords", lambda factory, month, cards: parsed)
+    monkeypatch.setattr("app.routes.parse_with_saved_passwords", lambda factory, month, cards, expected_provider="": parsed)
 
     response = client.post(f"/faturas/{invoice_id}/reprocessar", follow_redirects=True)
     assert response.status_code == 200
