@@ -436,6 +436,23 @@ def test_itau_adapter_does_not_treat_spaced_installment_as_a_second_date():
     assert items[0]["purchase_date"] == date(2025, 11, 28)
 
 
+def test_itau_adapter_reads_left_column_when_category_follows_amount():
+    details = """
+    LANÇAMENTOS: COMPRAS E SAQUES
+     28/11 GRUPO CASAS BAHIA 09/10       309,89                      supermercado ADAMANTINA
+     vestuário ADAMANTINA                                             05/07 LUANA BEATRIZ GERALDOAD 38,13
+     23/02 IEV ADAMANTINA 06/10            57,50                      restaurante ADAMANTINA
+     saúde ADAMANTINA                                                07/07 AUTO POSTO CARREIROADAM 50,00
+    Total dos lançamentos atuais 455,52
+    """
+    items = parse_itau_text(details, "2026-08")
+    assert [item["description"] for item in items] == [
+        "GRUPO CASAS BAHIA 09/10", "LUANA BEATRIZ GERALDOAD",
+        "IEV ADAMANTINA 06/10", "AUTO POSTO CARREIROADAM",
+    ]
+    assert sum(item["amount"] for item in items) == Decimal("455.52")
+
+
 def test_itau_screenshot_values_reconcile_purchases_products_and_fees():
     purchase_amounts = """
     28/11 GRUPO CASAS B 09/10 309,89
@@ -545,6 +562,39 @@ def test_bb_adapter_falls_back_to_rows_when_heading_is_an_image():
     items = parse_bb_smiles_text(text_layer, "2026-08")
     assert len(items) == 6
     assert sum(item["amount"] for item in items) == Decimal("294.31")
+
+
+def test_bb_scanned_pdf_uses_ocr_fallback(monkeypatch):
+    pages = ["", "", ""]
+    ocr_pages = ["""
+    Banco do Brasil
+    SMILES PLATINUM VISA
+    Valor R$ 294,31
+    Vencimento 10/08/2026
+    Lançamentos nesta fatura
+    Data Descrição País Valor
+    06/07 PGTO. CASH AG. 0470 R$ 661,26
+    07/07 APPLE.COM/BILL SAO PAULO BR R$ 66,90
+    13/07 TOTALPASS SAO PAULO BR R$ 59,90
+    15/07 Smiles Clube Smiles Barueri BR R$ 46,00
+    29/04 GOL LINHAS A* PARC 03/05 SAO PAULO BR R$ 30,80
+    23/07 CLUBE LIVELO* PARC 01/12 SANTANA DE P BR R$ 42,71
+    28/07 ANUIDADE DIFERENCIADA TIT-PARC 05/12 BR R$ 48,00
+    Total R$ 294,31
+    """, "", ""]
+
+    class FakeReader:
+        is_encrypted = False
+        def __init__(self, stream):
+            self.pages = []
+
+    monkeypatch.setattr("app.services.invoice_parser.PdfReader", FakeReader)
+    monkeypatch.setattr("app.services.invoice_parser.extract_pdf_pages", lambda reader: pages)
+    monkeypatch.setattr("app.services.invoice_parser.ocr_pdf_pages", lambda reader: ocr_pages)
+    parsed = parse_invoice_pdf(BytesIO(b"pdf"), "2026-08", expected_provider="bb_smiles")
+    assert parsed["adapter"] == "bb_smiles"
+    assert len(parsed["items"]) == 6
+    assert sum(item["amount"] for item in parsed["items"]) == Decimal("294.31")
 
 
 def test_itau_pdf_reads_current_purchases_beyond_third_page(monkeypatch):
