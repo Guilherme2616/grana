@@ -869,6 +869,28 @@ def add_invoice_payment(invoice_id):
     return redirect(url_for("main.invoices", status="confirmed"))
 
 
+@main.post("/faturas/<int:invoice_id>/total")
+@login_required
+def update_invoice_total(invoice_id):
+    invoice = db.get_or_404(Invoice, invoice_id)
+    if MonthlyClose.query.filter_by(reference_month=invoice.reference_month).first():
+        flash("A competência desta fatura está fechada. Reabra o mês antes de editar o total.", "warning")
+        return redirect(url_for("main.invoices"))
+    try:
+        total = form_decimal("total")
+        paid = sum((money(payment.amount) for payment in invoice.payments), Decimal("0"))
+        if total < 0 or total < paid:
+            raise ValueError
+        invoice.total = total
+        invoice.statement_total = total
+        db.session.commit()
+        flash("Total da fatura atualizado. As compras importadas foram preservadas.", "success")
+    except (ValueError, InvalidOperation):
+        db.session.rollback()
+        flash("Informe um total válido, igual ou maior que o valor já pago.", "danger")
+    return redirect(url_for("main.invoices", status=request.form.get("status", "confirmed")))
+
+
 @main.post("/faturas/sincronizar-drive")
 @login_required
 def sync_drive_invoices():
@@ -951,6 +973,13 @@ def review_invoice(invoice_id):
         if closing_date >= due_date:
             flash("O fechamento precisa acontecer antes do vencimento.", "danger")
             return render_template("review_invoice.html", invoice=invoice, categories=categories, suggestion=suggestion)
+        try:
+            official_total = form_decimal("official_total")
+            if official_total < 0:
+                raise ValueError
+        except (ValueError, InvalidOperation):
+            flash("Informe um valor total válido para a fatura.", "danger")
+            return render_template("review_invoice.html", invoice=invoice, categories=categories, suggestion=suggestion)
         total = Decimal("0")
         for item in invoice.items:
             item.selected = item.id in selected_ids
@@ -970,8 +999,8 @@ def review_invoice(invoice_id):
                 db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id, source="invoice", installment_current=item.installment_current, installment_total=item.installment_total, competence_month=invoice.reference_month, payment_responsibility=responsibility, personal_amount=personal_amount))
         source = "pdf" if request.form.get("date_source") == "pdf" else "manual"
         upsert_card_cycle(invoice.card, invoice.reference_month, closing_date, due_date, source)
-        official_total = invoice.statement_total
-        invoice.total = Decimal(official_total) if official_total else total
+        invoice.statement_total = official_total
+        invoice.total = official_total
         invoice.status = "confirmed"; db.session.commit()
         session.pop(f"invoice_cycle_{invoice.id}", None)
         flash(f"Fatura importada com {len(selected_ids)} compras e datas atualizadas.", "success")
