@@ -51,6 +51,12 @@ ITAU_END_PATTERN = re.compile(
     r"^(?:total\s+dos\s+lan[cç]amentos\s+atuais|compras\s+parceladas\s*-?\s*pr[oó]ximas\s+faturas)",
     re.IGNORECASE,
 )
+ITAU_FEES_SECTION_PATTERN = re.compile(r"encargos\s+cobrados\s+nesta\s+fatura", re.IGNORECASE)
+ITAU_FEE_PATTERN = re.compile(
+    rf"^(?P<description>juros\s+do\s+rotativo|juros\s+de\s+mora|multa\s+por\s+atraso|iof\s+de\s+financiamento)\b"
+    rf".*?(?P<amount>{AMOUNT_TEXT})\s*$",
+    re.IGNORECASE,
+)
 ITAU_ROW_DATE_PATTERN = re.compile(r"(?:^|\s{2,})(?P<date>\d{2}/\d{2})(?=\s+)")
 
 
@@ -531,6 +537,30 @@ def parse_itau_text(text, reference_month):
                 pending_date = row_date
                 pending_parts = [remainder]
 
+    fees_match = ITAU_FEES_SECTION_PATTERN.search(text)
+    if fees_match:
+        reference = datetime.strptime(reference_month, "%Y-%m").date()
+        for raw_line in text[fees_match.end():].splitlines():
+            line = " ".join(raw_line.split()).strip()
+            if re.match(r"^total\s+de\s+encargos", line, re.IGNORECASE):
+                break
+            fee_match = ITAU_FEE_PATTERN.match(line)
+            if not fee_match:
+                continue
+            amount = parse_brl(fee_match.group("amount"))
+            description = "Encargo Itaú — " + fee_match.group("description").strip().title()
+            identity = (reference.isoformat(), description.lower(), str(amount))
+            if amount <= 0 or identity in seen:
+                continue
+            seen.add(identity)
+            items.append({
+                "purchase_date": reference,
+                "description": description,
+                "amount": amount,
+                "installment_current": None,
+                "installment_total": None,
+            })
+
     return items
 
 
@@ -566,7 +596,7 @@ def extract_pdf_pages(reader):
     return pages
 
 
-def parse_invoice_pdf(stream, reference_month, password=""):
+def parse_invoice_pdf(stream, reference_month, password="", expected_provider=""):
     reader = PdfReader(stream)
     if reader.is_encrypted:
         if not password:
@@ -579,13 +609,13 @@ def parse_invoice_pdf(stream, reference_month, password=""):
     due_date = detect_due_date(text, reference_month)
     resolved_reference = due_date.strftime("%Y-%m") if due_date else reference_month
 
-    if is_bb_smiles_invoice(text):
+    if expected_provider == "bb_smiles" or is_bb_smiles_invoice(text):
         items = parse_bb_smiles_text(text, resolved_reference)
         statement_total = detect_bb_statement_total(text)
         adapter = "bb_smiles"
         credit_limit = None
         cash_advance_total = None
-    elif is_mercado_pago_invoice(text):
+    elif expected_provider == "mercado_pago" or is_mercado_pago_invoice(text):
         summary = parse_mercado_pago_summary(pages[0] if pages else text, reference_month)
         due_date = summary["due_date"] or due_date
         resolved_reference = due_date.strftime("%Y-%m") if due_date else reference_month
@@ -595,7 +625,7 @@ def parse_invoice_pdf(stream, reference_month, password=""):
         credit_limit = summary["credit_limit"]
         cash_advance_total = summary["cash_advance_total"]
         adapter = "mercado_pago"
-    elif is_banco_inter_invoice(text):
+    elif expected_provider == "banco_inter" or is_banco_inter_invoice(text):
         first_page = pages[0] if pages else text
         second_page = pages[1] if len(pages) > 1 else text
         summary = parse_banco_inter_summary(first_page, second_page, reference_month)
@@ -608,7 +638,7 @@ def parse_invoice_pdf(stream, reference_month, password=""):
         credit_limit = summary["credit_limit"]
         cash_advance_total = None
         adapter = "banco_inter"
-    elif is_itau_invoice(text):
+    elif expected_provider == "itau" or is_itau_invoice(text):
         first_page = pages[0] if pages else text
         third_page = pages[2] if len(pages) > 2 else text
         summary = parse_itau_summary(first_page, third_page, reference_month)
