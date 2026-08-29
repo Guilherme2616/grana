@@ -10,8 +10,8 @@ AMOUNT_TEXT = r"\d{1,3}(?:\.\d{3})*,\d{2}"
 AMOUNT_PATTERN = re.compile(rf"(?P<amount>-?\s*(?:R\$\s*)?{AMOUNT_TEXT}-?)\s*$")
 EXPIRY_WORD_PATTERN = re.compile(r"\b(?:data\s+de\s+)?vencimento\b|\bvence\b", re.IGNORECASE)
 BB_SECTION_PATTERN = re.compile(
-    r"lan[cç]amentos(?:\s+e\s+compras|\s+realizados)?(?:\s+do\s+cart[aã]o)?"
-    r"\s+(?:nesta|desta|da)\s+fatura",
+    r"(?:lan[cç]amentos|compras)(?:\s+e\s+compras|\s+realizados)?(?:\s+do\s+cart[aã]o)?"
+    r"\s+(?:(?:n|d)esta|da|na)\s+fatura",
     re.IGNORECASE,
 )
 BB_TABLE_HEADER_PATTERN = re.compile(
@@ -19,6 +19,11 @@ BB_TABLE_HEADER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 BB_TOTAL_LINE_PATTERN = re.compile(r"^total(?:\s|$)", re.IGNORECASE)
+BB_END_PATTERN = re.compile(
+    r"^(?:total(?:\s+(?:da|desta|sua))?\s+fatura|total\s+r\$|"
+    r"parcelamentos?|compras?\s+parceladas?).*(?:pr[oó]xima|futura)?",
+    re.IGNORECASE,
+)
 BB_COUNTRY_PATTERN = re.compile(r"\s+(?:[A-Z]{2}|\d{2})\s*$", re.IGNORECASE)
 BB_ANY_AMOUNT_PATTERN = re.compile(rf"(?P<amount>-?\s*(?:R\$\s*)?{AMOUNT_TEXT}-?)", re.IGNORECASE)
 MP_CARD_SECTION_PATTERN = re.compile(r"cart[aã]o\s+(?:visa|mastercard|elo|american\s+express)", re.IGNORECASE)
@@ -38,7 +43,10 @@ PT_MONTHS = {
     "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
     "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
 }
-ITAU_SECTION_PATTERN = re.compile(r"lan[cç]amentos\s*:\s*compras\s+e\s+saques", re.IGNORECASE)
+ITAU_SECTION_PATTERN = re.compile(
+    r"lan[cç]amentos\s*(?::|-)?\s*(?:compras\s+e\s+saques|do\s+cart[aã]o)",
+    re.IGNORECASE,
+)
 ITAU_END_PATTERN = re.compile(
     r"^(?:total\s+dos\s+lan[cç]amentos\s+atuais|compras\s+parceladas\s*-?\s*pr[oó]ximas\s+faturas)",
     re.IGNORECASE,
@@ -98,8 +106,12 @@ def detect_bb_statement_total(text):
     section_match = BB_SECTION_PATTERN.search(text)
     cover = text[:section_match.start()] if section_match else text
     patterns = (
-        re.compile(rf"\bValor\b\s*(?:\r?\n|\s)+R\$\s*(?P<amount>{AMOUNT_TEXT})", re.IGNORECASE),
-        re.compile(rf"^\s*Total\s+R\$\s*(?P<amount>{AMOUNT_TEXT})\s*$", re.IGNORECASE | re.MULTILINE),
+        re.compile(
+            rf"\b(?:valor(?:\s+total)?|total(?:\s+(?:da|desta|sua)\s+fatura)?|total\s+a\s+pagar)\b"
+            rf"\s*(?::|[eé]\s*:)?\s*(?:\r?\n|\s)+(?:R\$\s*)?(?P<amount>{AMOUNT_TEXT})",
+            re.IGNORECASE,
+        ),
+        re.compile(rf"^\s*Total\s+(?:R\$\s*)?(?P<amount>{AMOUNT_TEXT})\s*$", re.IGNORECASE | re.MULTILINE),
     )
     for pattern in patterns:
         match = pattern.search(cover)
@@ -116,8 +128,8 @@ def is_bb_smiles_invoice(text):
             "banco do brasil" in normalized
             or "bancodobrasil" in compact
             or "bb.com.br" in normalized
+            or "ourocard" in normalized
         )
-        and "smiles" in normalized
         and (
             BB_SECTION_PATTERN.search(text) is not None
             or BB_TABLE_HEADER_PATTERN.search(text) is not None
@@ -283,8 +295,15 @@ def parse_bb_smiles_text(text, reference_month):
         line = " ".join(raw_line.split()).strip()
         if not line:
             continue
-        if BB_TOTAL_LINE_PATTERN.match(line) and not line.lower().startswith("totalpass"):
+        lowered = line.lower()
+        if BB_END_PATTERN.match(line) and not lowered.startswith("totalpass"):
             break
+        if (
+            BB_TABLE_HEADER_PATTERN.search(line)
+            or BB_SECTION_PATTERN.search(line)
+            or lowered in {"pagamentos", "compras", "compras diversas", "lançamentos", "data", "descrição", "país", "valor"}
+        ):
+            continue
 
         date_match = re.match(r"^(?P<date>\d{2}/\d{2}(?:/\d{2,4})?)(?:\s+|$)(?P<rest>.*)$", line)
         if date_match:
@@ -298,8 +317,11 @@ def parse_bb_smiles_text(text, reference_month):
         combined = " ".join(pending_parts)
         # Algumas versões extraem a coluna País depois do valor; por isso o
         # leitor do BB não exige mais que o valor seja o último texto da linha.
-        amount_match = BB_ANY_AMOUNT_PATTERN.search(combined)
-        if amount_match:
+        # Em compras internacionais o PDF pode trazer o valor na moeda
+        # original e, por último, o valor efetivamente lançado em reais.
+        amount_matches = list(BB_ANY_AMOUNT_PATTERN.finditer(combined))
+        if amount_matches:
+            amount_match = amount_matches[-1]
             description = combined[:amount_match.start()]
             installment_match = SLASH_INSTALLMENT_PATTERN.search(description)
             _append_item(
@@ -456,8 +478,30 @@ def parse_itau_text(text, reference_month):
     section = text[section_match.end():]
     items = []
     seen = set()
+    pending_date = None
+    pending_parts = []
+
+    def append_segment(row_date, remainder):
+        amount_matches = list(AMOUNT_PATTERN.finditer(remainder))
+        if not amount_matches:
+            return False
+        amount_match = amount_matches[-1]
+        description = remainder[:amount_match.start()].strip()
+        installment_match = SLASH_INSTALLMENT_PATTERN.search(description) or INSTALLMENT_PATTERN.search(description)
+        _append_item(
+            items,
+            seen,
+            row_date,
+            description,
+            amount_match.group("amount"),
+            reference_month,
+            int(installment_match.group("current")) if installment_match else None,
+            int(installment_match.group("total")) if installment_match else None,
+        )
+        return True
 
     for raw_line in section.splitlines():
+        raw_line = raw_line.lstrip()
         normalized_line = " ".join(raw_line.split()).strip()
         if not normalized_line:
             continue
@@ -467,27 +511,25 @@ def parse_itau_text(text, reference_month):
         # A página 2 possui duas tabelas lado a lado. Os espaços preservados pelo
         # modo layout permitem separar duas compras que estejam na mesma linha.
         date_matches = list(ITAU_ROW_DATE_PATTERN.finditer(raw_line))
+        if not date_matches:
+            if pending_date:
+                pending_parts.append(normalized_line)
+                if append_segment(pending_date, " ".join(pending_parts)):
+                    pending_date = None
+                    pending_parts = []
+            continue
+
+        pending_date = None
+        pending_parts = []
         for index, date_match in enumerate(date_matches):
             start = date_match.start("date")
             end = date_matches[index + 1].start("date") if index + 1 < len(date_matches) else len(raw_line)
             segment = " ".join(raw_line[start:end].split()).strip()
             row_date = date_match.group("date")
             remainder = segment[len(row_date):].strip()
-            amount_match = AMOUNT_PATTERN.search(remainder)
-            if not amount_match:
-                continue
-            description = remainder[:amount_match.start()].strip()
-            installment_match = SLASH_INSTALLMENT_PATTERN.search(description)
-            _append_item(
-                items,
-                seen,
-                row_date,
-                description,
-                amount_match.group("amount"),
-                reference_month,
-                int(installment_match.group("current")) if installment_match else None,
-                int(installment_match.group("total")) if installment_match else None,
-            )
+            if not append_segment(row_date, remainder) and len(date_matches) == 1:
+                pending_date = row_date
+                pending_parts = [remainder]
 
     return items
 
