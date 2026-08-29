@@ -419,6 +419,101 @@ def test_itau_adapter_keeps_old_purchases_installments_and_wrapped_rows():
     assert all("08/12" not in item["description"] for item in items)
 
 
+def test_itau_screenshot_values_reconcile_purchases_products_and_fees():
+    purchase_amounts = """
+    28/11 GRUPO CASAS B 09/10 309,89
+    23/02 IEV ADAMANTINA 06/10 57,50
+    12/03 MADAME CALCADOS 05/10 51,98
+    22/04 GUERINO SECCO 04/06 105,50
+    04/05 FARMACIA SANTA 03/03 33,29
+    10/05 GUERINO SECCO 03/06 73,33
+    10/05 HOTELTOBARUERI 03/10 40,07
+    10/05 KINGS PAPURO 03/10 89,99
+    19/05 GESA TEXSAO P 03/03 117,00
+    19/05 Copatec Corner 03/03 53,16
+    20/05 PIRACICABANA S 03/06 47,05
+    22/05 LOCCITANE PA 03/03 56,00
+    31/05 PAG*SteamSao P 03/04 48,89
+    12/06 MARTA L N K. 02/02 62,45
+    04/07 LARISSA BORGES RONDON 37,40
+    05/07 ILUANA BEATRIZ GERALDOAD 38,13
+    05/07 ILUANA BEATRIZ GERALDOAD 6,00
+    07/07 AUTO POSTO CARREIROADAM 50,00
+    07/07 SUPERMERCADO RAVAZIADAM 32,67
+    09/07 DFINCOLAS RGDIM BENA 38,81
+    09/07 EBN *PLATSTATIONCURI 74,90
+    10/07 TOTALPASS SAO PAULO 79,90
+    10/07 SUPERMERCADO RAVAZIADAM 11,28
+    11/07 JM.COM-LANCHONETE READ 40,00
+    12/07 IFOOD DOCE LOCOSacoBRA 5,95
+    12/07 THE BEST ACAIOSVALDO CR 25,96
+    13/07 BLENDS BARDAMANTINABRA 35,51
+    17/07 VIA SABORADAMANTINABRA 28,69
+    18/07 BarSaHimiADAMANTINABRA 70,80
+    18/07 CineHotADAMANTINABRA 50,00
+    22/07 BARACA ARAZONADAMANT 47,00
+    23/07 SUPERMERCADO RAVAZIADAM 22,17
+    26/07 MARCIA REGINA GRECOPENA 48,00
+    28/07 AGD EVENTOSDRA 01/02 60,00
+    28/07 SUPERMERCADO RAVAZIADAM 11,84
+    28/07 AUTO POSTO CARREIROADAM 50,00
+    29/07 CONVENIENCIA DO LUIZADA 96,00
+    31/07 SUPERMERCADO RAVAZIADAM 30,67
+    31/07 SUPERMERCADO RAVAZIADAM 59,94
+    """
+    details = f"""
+    LANÇAMENTOS: COMPRAS E SAQUES
+    {purchase_amounts}
+    Lançamentos no cartão 2.197,72
+    Lançamentos: produtos e serviços
+    02/07 Mensalidade - Plano do Anuidade Diferenciada 88,00
+    Lançamentos produtos e serviços 88,00
+    Total dos lançamentos atuais 2.285,72
+    Compras parceladas - próximas faturas
+    28/11 GRUPO CASAS B 10/10 309,89
+    Encargos cobrados nesta fatura
+    Juros do rotativo 12,50 % aa 10,32
+    Juros de mora 1,00 % am 0,93
+    Multa por atraso 2,00 % 55,78
+    IOF de financiamento 10,83
+    Total de encargos em R$ 77,86
+    """
+    items = parse_itau_text(details, "2026-08")
+    assert len(items) == 44
+    assert sum(item["amount"] for item in items) == Decimal("2363.58")
+    assert sum(item["amount"] for item in items if item["description"].startswith("Encargo Itaú")) == Decimal("77.86")
+
+
+def test_bb_screenshot_values_reconcile_exactly():
+    details = """
+    Lançamentos nesta fatura
+    Data Descrição País Valor
+    01- GUILHERME N Cartão N. 0921
+    Pagamentos
+    06/07 PGTO. CASH AG. 0470 000047000 200 10 R$ 661,26-
+    Compras diversas
+    07/07 APPLE.COM/BILL SAO PAULO BR R$ 66,90
+    13/07 TOTALPASS SAO PAULO BR R$ 59,90
+    Compras por mala direta/telefone
+    15/07 Smiles Clube Smiles Barueri BR R$ 46,00
+    Compras/Pgto Contas Parc
+    Companhias aereas
+    29/04 GOL LINHAS A* PARC 03/05 SAO PAULO BR R$ 30,80
+    Compras por mala direta/telefone
+    23/07 CLUBE LIVELO* PARC 01/12 SANTANA DE P BR R$ 42,71
+    Data Descrição País Valor
+    Anuidades
+    28/07 ANUIDADE DIFERENCIADA TIT-PARC 05/12 BR R$ 48,00
+    Subtotal R$ 294,31
+    Total R$ 294,31
+    Parcelamentos Próxima Fatura
+    29/04 GOL LINHAS A* PARC 04/05 SAO PAULO BR R$ 30,80
+    """
+    items = parse_bb_smiles_text(details, "2026-08")
+    assert len(items) == 6
+    assert sum(item["amount"] for item in items) == Decimal("294.31")
+
+
 def test_itau_pdf_reads_current_purchases_beyond_third_page(monkeypatch):
     pages = [
         """Itaú Personnalité\nO total da sua fatura é: R$ 60,00\nVencimento 10/08/2026\nLimite total de crédito R$ 15.000,00""",
