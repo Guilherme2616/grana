@@ -514,6 +514,22 @@ def test_bb_screenshot_values_reconcile_exactly():
     assert sum(item["amount"] for item in items) == Decimal("294.31")
 
 
+def test_bb_adapter_falls_back_to_rows_when_heading_is_an_image():
+    text_layer = """
+    06/07 PGTO. CASH AG. 0470 000047000 200 10 R$ 661,26-
+    07/07 APPLE.COM/BILL SAO PAULO BR R$ 66,90
+    13/07 TOTALPASS SAO PAULO BR R$ 59,90
+    15/07 Smiles Clube Smiles Barueri BR R$ 46,00
+    29/04 GOL LINHAS A* PARC 03/05 SAO PAULO BR R$ 30,80
+    23/07 CLUBE LIVELO* PARC 01/12 SANTANA DE P BR R$ 42,71
+    28/07 ANUIDADE DIFERENCIADA TIT-PARC 05/12 BR R$ 48,00
+    Total R$ 294,31
+    """
+    items = parse_bb_smiles_text(text_layer, "2026-08")
+    assert len(items) == 6
+    assert sum(item["amount"] for item in items) == Decimal("294.31")
+
+
 def test_itau_pdf_reads_current_purchases_beyond_third_page(monkeypatch):
     pages = [
         """Itaú Personnalité\nO total da sua fatura é: R$ 60,00\nVencimento 10/08/2026\nLimite total de crédito R$ 15.000,00""",
