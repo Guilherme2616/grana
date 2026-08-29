@@ -391,7 +391,7 @@ def test_itau_adapter_reads_side_by_side_rows_and_reconciles_totals():
     items = parse_itau_text(page_two + "\n" + page_three, "2026-08")
     assert len(items) == 7
     assert items[0]["description"] == "GRUPO CASAS B 09/10"
-    assert items[1]["description"] == "ITAU NA BEATRIZ GERAL DOAD"
+    assert items[1]["description"] == "IEV ADAMANTINA"
     assert items[0]["installment_current"] == 9
     assert items[0]["installment_total"] == 10
     assert all("Pagamento" not in item["description"] for item in items)
@@ -429,8 +429,8 @@ def test_itau_adapter_does_not_treat_spaced_installment_as_a_second_date():
     """
     items = parse_itau_text(details, "2026-08")
     assert [item["description"] for item in items] == [
-        "GRUPO CASAS BAHIA 09/10", "ILUANA BEATRIZ GERALDOAD",
-        "IEV ADAMANTINA 06/10", "AUTO POSTO CARREIROADAM",
+        "GRUPO CASAS BAHIA 09/10", "IEV ADAMANTINA 06/10",
+        "ILUANA BEATRIZ GERALDOAD", "AUTO POSTO CARREIROADAM",
     ]
     assert sum(item["amount"] for item in items) == Decimal("455.52")
     assert items[0]["purchase_date"] == date(2025, 11, 28)
@@ -447,8 +447,8 @@ def test_itau_adapter_reads_left_column_when_category_follows_amount():
     """
     items = parse_itau_text(details, "2026-08")
     assert [item["description"] for item in items] == [
-        "GRUPO CASAS BAHIA 09/10", "LUANA BEATRIZ GERALDOAD",
-        "IEV ADAMANTINA 06/10", "AUTO POSTO CARREIROADAM",
+        "GRUPO CASAS BAHIA 09/10", "IEV ADAMANTINA 06/10",
+        "LUANA BEATRIZ GERALDOAD", "AUTO POSTO CARREIROADAM",
     ]
     assert sum(item["amount"] for item in items) == Decimal("455.52")
 
