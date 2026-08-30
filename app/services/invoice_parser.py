@@ -265,7 +265,7 @@ def _append_item(
     installment_current=None,
     installment_total=None,
 ):
-    description = " ".join(raw_description.split()).strip(" -–—·")
+    description = " ".join(raw_description.split()).strip(" -–—·|")
     description = BB_COUNTRY_PATTERN.sub("", description).strip()
     if len(description) < 2:
         return
@@ -653,12 +653,107 @@ def extract_pdf_pages(reader):
     return pages
 
 
+def _bb_compact_table_image(image):
+    """Recorta somente as linhas datadas da grade do BB digitalizado.
+
+    A fatura Smiles é uma imagem de página inteira. Reconhecer publicidade,
+    textos legais e caixas de resumo torna o Tesseract inviável no servidor
+    de produção. As linhas horizontais da tabela, por outro lado, são estáveis
+    e permitem montar uma imagem pequena somente com os lançamentos.
+    """
+    from PIL import Image, ImageOps
+
+    prepared = ImageOps.autocontrast(image.convert("L"))
+    width, height = prepared.size
+    left = int(width * 0.05)
+    right = int(width * 0.95)
+
+    # Soma horizontal feita pelo Pillow (em C), evitando percorrer todos os
+    # pixels em Python no ambiente de CPU limitada do PythonAnywhere.
+    dark = prepared.point(lambda value: 255 if value < 230 else 0)
+    row_density = dark.crop((left, 0, right, height)).resize(
+        (1, height),
+        Image.Resampling.BOX,
+    )
+    horizontal = [index for index, value in enumerate(row_density.getdata()) if value > 165]
+
+    groups = []
+    for y in horizontal:
+        if not groups or y > groups[-1][-1] + 1:
+            groups.append([y])
+        else:
+            groups[-1].append(y)
+    lines = [sum(group) // len(group) for group in groups]
+
+    minimum_gap = max(12, int(height * 0.012))
+    maximum_gap = max(30, int(height * 0.03))
+    runs = []
+    current = []
+    for y in lines:
+        if current and not minimum_gap <= y - current[-1] <= maximum_gap:
+            if len(current) >= 5:
+                runs.append(current)
+            current = []
+        current.append(y)
+    if len(current) >= 5:
+        runs.append(current)
+    if not runs:
+        return None
+
+    table_lines = max(runs, key=len)
+    candidates = []
+    first_column_left = int(width * 0.065)
+    first_column_right = int(width * 0.13)
+    content_left = int(width * 0.06)
+    content_right = int(width * 0.94)
+    for row_index, (top, bottom) in enumerate(zip(table_lines, table_lines[1:])):
+        if bottom - top < 8:
+            continue
+        date_cell = prepared.crop((first_column_left, top + 2, first_column_right, bottom - 1))
+        dark_pixels = sum(1 for value in date_cell.getdata() if value < 160)
+        if dark_pixels > 40:
+            candidates.append((row_index, prepared.crop((content_left, top + 2, content_right, bottom - 1))))
+
+    if not candidates:
+        return None
+
+    # Na página final, a grade repete lançamentos futuros depois de um bloco de
+    # subtotal/total. Essa separação produz várias linhas sem data; ao detectar
+    # o salto, conserva somente o primeiro bloco (a fatura atual).
+    cutoff = len(candidates)
+    for index in range(1, len(candidates)):
+        if candidates[index][0] - candidates[index - 1][0] >= 4:
+            cutoff = index
+            break
+    rows = [row for _, row in candidates[:cutoff]]
+    if not rows:
+        return None
+
+    spacing = 4
+    compact = Image.new(
+        "L",
+        (max(row.width for row in rows), sum(row.height for row in rows) + spacing * (len(rows) - 1)),
+        255,
+    )
+    y = 0
+    for row in rows:
+        compact.paste(row, (0, y))
+        y += row.height + spacing
+    return compact
+
+
+def _normalize_bb_ocr_text(recognized):
+    """Corrige confusões previsíveis do Tesseract no quadro monetário."""
+    recognized = re.sub(r"\bR[SG§g]\s*(?=\d)", "R$ ", recognized, flags=re.IGNORECASE)
+    return re.sub(r"(?<=\d)\.(?=\d{2}(?:\D|$))", ",", recognized)
+
+
 def ocr_pdf_pages(reader):
     """Renderiza e reconhece PDFs digitalizados que não possuem camada de texto."""
     if not shutil.which("pdftoppm") or not shutil.which("tesseract"):
         return []
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image
         import pytesseract
     except ImportError:
         return []
@@ -674,11 +769,13 @@ def ocr_pdf_pages(reader):
         prefix = temporary / "page"
         try:
             subprocess.run(
-                ["pdftoppm", "-png", "-gray", "-r", "160", str(decrypted_pdf), str(prefix)],
+                # A primeira página contém apenas o resumo. Os lançamentos do
+                # layout BB Smiles começam na página 2.
+                ["pdftoppm", "-f", "2", "-png", "-gray", "-r", "130", str(decrypted_pdf), str(prefix)],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=45,
+                timeout=90,
             )
         except (OSError, subprocess.SubprocessError):
             return []
@@ -687,14 +784,18 @@ def ocr_pdf_pages(reader):
         for image_path in sorted(temporary.glob("page-*.png")):
             try:
                 with Image.open(image_path) as image:
-                    prepared = ImageOps.autocontrast(image.convert("L"))
-                    pages.append(
-                        pytesseract.image_to_string(
-                            prepared,
-                            config="--psm 6",
-                            timeout=30,
-                        )
+                    prepared = _bb_compact_table_image(image)
+                    if prepared is None:
+                        pages.append("")
+                        continue
+                    recognized = pytesseract.image_to_string(
+                        prepared,
+                        config="--psm 6",
+                        timeout=120,
                     )
+                    # Normaliza duas confusões recorrentes sem alterar nomes:
+                    # símbolo monetário (RS/R§) e separador decimal por ponto.
+                    pages.append(_normalize_bb_ocr_text(recognized))
             except (OSError, RuntimeError):
                 pages.append("")
         return pages
