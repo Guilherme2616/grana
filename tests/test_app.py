@@ -10,6 +10,7 @@ from app.models import Account, CardCycle, Category, CategoryRule, CreditCard, F
 from app.services.drive_sync import month_folder_matches, normalize_folder_name
 from app.services.financial_analytics import build_installment_projection, month_label, shift_month
 from app.services.invoice_parser import (
+    _normalize_bb_ocr_text,
     detect_bb_statement_total,
     detect_due_date,
     is_banco_inter_invoice,
@@ -608,6 +609,24 @@ def test_bb_scanned_pdf_uses_ocr_fallback(monkeypatch):
     assert parsed["adapter"] == "bb_smiles"
     assert len(parsed["items"]) == 6
     assert sum(item["amount"] for item in parsed["items"]) == Decimal("294.31")
+
+
+def test_bb_real_ocr_noise_is_normalized_and_reconciles():
+    recognized = """
+    06/07 | PGTO.CASH AG. 0470 000047000 200 10 RS 661,26-
+    07/07 | APPLE.COM/BILL_ SAO PAULO BR RS 66,90
+    13/07 TOTALPASS SAO PAULO BR R$ 59.90
+    15/07 | Smiles Clube Smiles Barueri BR R$ 46,00
+    29/04 | GOLLINHAS A* PARC 03/05 SAO PAULO BR RS 30,80
+    23/07 | CLUBE LIVELO* PARC 01/12 SANTANA DE P BR RS 42,71
+    Data | Descricao Pais Valor
+    28/07 | ANUIDADE DIFERENCIADA TIT-PARC 05/12 BR R§ 48,00
+    """
+    items = parse_bb_smiles_text(_normalize_bb_ocr_text(recognized), "2026-08")
+    assert len(items) == 6
+    assert sum(item["amount"] for item in items) == Decimal("294.31")
+    assert items[0]["description"] == "APPLE.COM/BILL_ SAO PAULO"
+    assert items[-1]["description"] == "ANUIDADE DIFERENCIADA TIT-PARC 05/12"
 
 
 def test_itau_pdf_reads_current_purchases_beyond_third_page(monkeypatch):
