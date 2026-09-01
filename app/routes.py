@@ -2,7 +2,7 @@ import calendar
 import csv
 import json
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 
@@ -11,7 +11,7 @@ from flask_login import current_user, login_required, login_user, logout_user
 from sqlalchemy import extract, func
 
 from .extensions import db
-from .models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
+from .models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, IntegrationSetting, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
 from .services.drive_sync import (
     DriveAccessError,
     DriveConfigurationError,
@@ -26,6 +26,7 @@ from .services.financial_analytics import (
     shift_month,
 )
 from .services.invoice_parser import PdfPasswordInvalid, PdfPasswordRequired, parse_invoice_pdf
+from .services.market_data import MarketDataError, fetch_brapi_quote
 from .services.secret_store import decrypt_secret, encrypt_secret
 
 
@@ -308,11 +309,85 @@ def filter_transactions(rows, filters):
     return result
 
 
+def integration_secret(key):
+    setting = IntegrationSetting.query.filter_by(key=key).first()
+    return decrypt_secret(setting.encrypted_value) if setting else ""
+
+
+def build_investment_positions(items):
+    positions = []
+    for asset in sorted({row.asset for row in items if row.operation in {"Compra", "Venda"}}):
+        asset_rows = [row for row in items if row.asset == asset]
+        buys = [row for row in asset_rows if row.operation == "Compra"]
+        sales = [row for row in asset_rows if row.operation == "Venda"]
+        quantity = sum((Decimal(row.quantity) for row in buys), Decimal("0")) - sum((Decimal(row.quantity) for row in sales), Decimal("0"))
+        if quantity <= 0:
+            continue
+        bought_quantity = sum((Decimal(row.quantity) for row in buys), Decimal("0"))
+        cost = sum((row.total_value + Decimal(row.fees or 0) for row in buys), Decimal("0"))
+        average = cost / bought_quantity if bought_quantity else Decimal("0")
+        quote = AssetPrice.query.filter_by(asset=asset).first()
+        current_price = Decimal(quote.current_price) if quote else average
+        current_value = quantity * current_price
+        invested_cost = quantity * average
+        pnl = current_value - invested_cost
+        receipts = sum((row.total_value for row in asset_rows if row.operation == "Recebimento"), Decimal("0"))
+        positions.append({
+            "asset": asset,
+            "asset_name": quote.asset_name if quote else "",
+            "quantity": quantity,
+            "average": average,
+            "current_price": current_price,
+            "current_value": current_value,
+            "invested_cost": invested_cost,
+            "pnl": pnl,
+            "return_pct": (pnl / invested_cost * 100).quantize(Decimal("0.1")) if invested_cost else None,
+            "receipts": receipts,
+            "change_percent": Decimal(quote.change_percent) if quote and quote.change_percent is not None else None,
+            "quote_source": quote.source if quote else "cost",
+            "updated_at": quote.updated_at if quote else None,
+        })
+    return positions
+
+
+def refresh_asset_quotes(assets, force=False):
+    token = integration_secret("brapi_token")
+    if not token:
+        return {"updated": 0, "skipped": 0, "errors": [], "configured": False}
+
+    now = datetime.utcnow()
+    cutoff = now - timedelta(minutes=30)
+    result = {"updated": 0, "skipped": 0, "errors": [], "configured": True}
+    for asset in sorted(set(assets)):
+        quote = AssetPrice.query.filter_by(asset=asset).first()
+        last_check = quote.last_attempt_at if quote else None
+        if not force and last_check and last_check >= cutoff:
+            result["skipped"] += 1
+            continue
+        try:
+            market_quote = fetch_brapi_quote(asset, token)
+            if not quote:
+                quote = AssetPrice(asset=asset, current_price=market_quote["price"])
+            quote.current_price = market_quote["price"]
+            quote.asset_name = market_quote["name"]
+            quote.change_percent = market_quote["change_percent"]
+            quote.source = "brapi"
+            quote.last_attempt_at = now
+            db.session.add(quote)
+            db.session.commit()
+            result["updated"] += 1
+        except MarketDataError as exc:
+            db.session.rollback()
+            if quote:
+                quote.last_attempt_at = now
+                db.session.add(quote)
+                db.session.commit()
+            result["errors"].append(f"{asset}: {exc}")
+    return result
+
+
 def investment_position():
-    items = Investment.query.all()
-    buys = sum((item.total_value for item in items if item.operation == "Compra"), Decimal("0"))
-    sales = sum((item.total_value for item in items if item.operation == "Venda"), Decimal("0"))
-    return buys - sales
+    return sum((row["current_value"] for row in build_investment_positions(Investment.query.all())), Decimal("0"))
 
 
 def cash_balance():
@@ -1462,6 +1537,8 @@ def investments():
     items = query.order_by(Investment.operation_date.desc(), Investment.id.desc()).all()
 
     all_items = Investment.query.all()
+    position_assets = {row.asset for row in all_items if row.operation in {"Compra", "Venda"}}
+    refresh_asset_quotes(position_assets)
     total_buys = sum((item.total_value for item in all_items if item.operation == "Compra"), Decimal("0"))
     total_sales = sum((item.total_value for item in all_items if item.operation == "Venda"), Decimal("0"))
     total_receipts = sum((item.total_value for item in all_items if item.operation == "Recebimento"), Decimal("0"))
@@ -1470,21 +1547,67 @@ def investments():
     total_transferred = money(db.session.query(func.sum(Transaction.amount)).filter(Transaction.kind == "expense", Transaction.category_id.in_(category_ids)).scalar()) if category_ids else Decimal("0")
     invested_value = total_buys - total_sales
     broker_balance = total_transferred - total_buys + total_sales + total_receipts
-    positions = []
-    for asset in sorted({row.asset for row in all_items if row.operation in {"Compra","Venda"}}):
-        asset_rows = [row for row in all_items if row.asset == asset]
-        buys = [row for row in asset_rows if row.operation == "Compra"]
-        sales = [row for row in asset_rows if row.operation == "Venda"]
-        quantity = sum((Decimal(row.quantity) for row in buys),Decimal("0"))-sum((Decimal(row.quantity) for row in sales),Decimal("0"))
-        cost = sum((row.total_value + Decimal(row.fees or 0) for row in buys),Decimal("0"))
-        average = cost / sum((Decimal(row.quantity) for row in buys),Decimal("0")) if buys else Decimal("0")
-        quote = AssetPrice.query.filter_by(asset=asset).first(); current_price = Decimal(quote.current_price) if quote else average
-        current_value = quantity * current_price; invested_cost = quantity * average; pnl = current_value-invested_cost
-        receipts = sum((row.total_value for row in asset_rows if row.operation == "Recebimento"),Decimal("0"))
-        positions.append({"asset":asset,"quantity":quantity,"average":average,"current_price":current_price,"current_value":current_value,"pnl":pnl,"return_pct":(pnl/invested_cost*100).quantize(Decimal("0.1")) if invested_cost else None,"receipts":receipts,"updated_at":quote.updated_at if quote else None})
+    positions = build_investment_positions(all_items)
+    portfolio_value = sum((row["current_value"] for row in positions), Decimal("0"))
+    portfolio_cost = sum((row["invested_cost"] for row in positions), Decimal("0"))
+    portfolio_pnl = portfolio_value - portfolio_cost
+    portfolio_return_pct = (portfolio_pnl / portfolio_cost * 100).quantize(Decimal("0.1")) if portfolio_cost else None
     categories = [row[0] for row in db.session.query(Investment.category).distinct().order_by(Investment.category).all()]
     subcategories = [row[0] for row in db.session.query(Investment.subcategory).filter(Investment.subcategory != "").distinct().order_by(Investment.subcategory).all()]
-    return render_template("investments.html", investments=items, positions=positions, today=date.today(), total_transferred=total_transferred, total_buys=total_buys, total_sales=total_sales, total_receipts=total_receipts, invested_value=invested_value, broker_balance=broker_balance, categories=categories, subcategories=subcategories, filters={"start":start,"end":end,"category":category,"subcategory":subcategory})
+    return render_template(
+        "investments.html", investments=items, positions=positions, today=date.today(),
+        total_transferred=total_transferred, total_buys=total_buys, total_sales=total_sales,
+        total_receipts=total_receipts, invested_value=invested_value, broker_balance=broker_balance,
+        portfolio_value=portfolio_value, portfolio_cost=portfolio_cost, portfolio_pnl=portfolio_pnl,
+        portfolio_return_pct=portfolio_return_pct, brapi_configured=bool(integration_secret("brapi_token")),
+        categories=categories, subcategories=subcategories,
+        filters={"start":start,"end":end,"category":category,"subcategory":subcategory},
+    )
+
+
+@main.post("/investimentos/brapi")
+@login_required
+def configure_brapi():
+    if request.form.get("action") == "clear":
+        setting = IntegrationSetting.query.filter_by(key="brapi_token").first()
+        if setting:
+            db.session.delete(setting)
+            db.session.commit()
+        flash("Integração com a Brapi removida.", "success")
+        return redirect(url_for("main.investments"))
+
+    token = request.form.get("token", "").strip()
+    if not token:
+        flash("Informe a chave da Brapi.", "danger")
+        return redirect(url_for("main.investments"))
+    try:
+        first_asset = db.session.query(Investment.asset).filter(Investment.operation == "Compra").first()
+        fetch_brapi_quote(first_asset[0] if first_asset else "PETR4", token)
+        setting = IntegrationSetting.query.filter_by(key="brapi_token").first()
+        if not setting:
+            setting = IntegrationSetting(key="brapi_token", encrypted_value="")
+        setting.encrypted_value = encrypt_secret(token)
+        db.session.add(setting)
+        db.session.commit()
+        flash("Brapi conectada. As cotações serão atualizadas automaticamente.", "success")
+    except MarketDataError as exc:
+        db.session.rollback()
+        flash(str(exc), "danger")
+    return redirect(url_for("main.investments"))
+
+
+@main.post("/investimentos/cotacoes/atualizar")
+@login_required
+def refresh_investment_prices():
+    assets = [row[0] for row in db.session.query(Investment.asset).filter(Investment.operation.in_(["Compra", "Venda"])).distinct().all()]
+    result = refresh_asset_quotes(assets, force=True)
+    if not result["configured"]:
+        flash("Configure a chave da Brapi antes de atualizar as cotações.", "warning")
+    elif result["errors"]:
+        flash(f"{result['updated']} cotação(ões) atualizada(s). " + " · ".join(result["errors"]), "warning")
+    else:
+        flash(f"{result['updated']} cotação(ões) atualizada(s) pela Brapi.", "success")
+    return redirect(url_for("main.investments"))
 
 
 @main.post("/investimentos/cotacao")
@@ -1494,7 +1617,7 @@ def update_asset_price():
         asset=request.form["asset"].strip().upper(); price=form_decimal("current_price")
         if not asset or price<=0: raise ValueError
         quote=AssetPrice.query.filter_by(asset=asset).first() or AssetPrice(asset=asset,current_price=price)
-        quote.current_price=price; db.session.add(quote); db.session.commit(); flash("Cotação atualizada.", "success")
+        quote.current_price=price; quote.source="manual"; quote.change_percent=None; quote.last_attempt_at=datetime.utcnow(); db.session.add(quote); db.session.commit(); flash("Cotação atualizada.", "success")
     except (ValueError,InvalidOperation):
         db.session.rollback(); flash("Informe ativo e cotação válidos.", "danger")
     return redirect(url_for("main.investments"))
