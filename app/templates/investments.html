@@ -1,9 +1,63 @@
-{% extends 'base.html' %}{% block title %}Investimentos · Grana{% endblock %}{% block content %}
-<header class="page-head"><div><span class="eyebrow">PATRIMÔNIO EM CONSTRUÇÃO</span><h1>Investimentos</h1><p>Acompanhe aportes, operações e o saldo disponível na corretora.</p></div><div class="page-actions"><a class="secondary-button" href="{{ url_for('main.investment_simulator') }}">Simular crescimento</a><button class="primary-button" data-open="investment-form">＋ Nova operação</button></div></header>
-<section class="investment-hero"><div><span>TOTAL TRANSFERIDO</span><strong>{{ total_transferred|brl }}</strong><small>Movimentações na categoria Investimentos</small></div><div class="investment-hero-main"><span>VALOR INVESTIDO</span><strong>{{ invested_value|brl }}</strong><small>Compras menos vendas</small></div><div><span>SALDO NA CORRETORA</span><strong>{{ broker_balance|brl }}</strong><small>Disponível após operações</small></div></section>
-<section class="investment-metrics"><article><span>Compras</span><strong>{{ total_buys|brl }}</strong></article><article><span>Vendas</span><strong>{{ total_sales|brl }}</strong></article><article><span>Recebimentos</span><strong>{{ total_receipts|brl }}</strong></article></section>
-<section class="panel table-panel"><div class="panel-head"><div><span>CARTEIRA ATUAL</span><h2>Posição, preço médio e rentabilidade</h2></div></div><div class="table-wrap"><table><thead><tr><th>Ativo</th><th>Quantidade</th><th>Preço médio</th><th>Cotação</th><th>Valor atual</th><th>Resultado</th><th>Proventos</th><th>Atualizar</th></tr></thead><tbody>{% for row in positions %}<tr><td><strong>{{ row.asset }}</strong></td><td>{{ row.quantity }}</td><td>{{ row.average|brl }}</td><td>{{ row.current_price|brl }}</td><td>{{ row.current_value|brl }}</td><td class="{{ 'positive' if row.pnl>=0 else 'negative' }}">{{ row.pnl|brl }}{% if row.return_pct is not none %}<small class="table-subtitle">{{ row.return_pct }}%</small>{% endif %}</td><td>{{ row.receipts|brl }}</td><td><form method="post" action="{{ url_for('main.update_asset_price') }}" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="asset" value="{{ row.asset }}"><input name="current_price" placeholder="Cotação"><button class="secondary-button">Salvar</button></form></td></tr>{% else %}<tr><td colspan="8" class="empty">Registre compras para formar a carteira.</td></tr>{% endfor %}</tbody></table></div></section>
+{% extends 'base.html' %}
+{% block title %}Investimentos · Grana{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div><span class="eyebrow">PATRIMÔNIO EM CONSTRUÇÃO</span><h1>Investimentos</h1><p>Acompanhe operações e o valor de mercado da sua carteira.</p></div>
+  <div class="page-actions">
+    {% if brapi_configured %}
+    <form method="post" action="{{ url_for('main.refresh_investment_prices') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="secondary-button">↻ Atualizar agora</button></form>
+    {% endif %}
+    <a class="secondary-button" href="{{ url_for('main.investment_simulator') }}">Simular crescimento</a>
+    <button class="primary-button" data-open="investment-form">＋ Nova operação</button>
+  </div>
+</header>
+
+<section class="investment-hero">
+  <div><span>TOTAL TRANSFERIDO</span><strong>{{ total_transferred|brl }}</strong><small>Movimentações destinadas a investimentos</small></div>
+  <div class="investment-hero-main"><span>VALOR ATUAL DA CARTEIRA</span><strong>{{ portfolio_value|brl }}</strong><small>Cotações da Brapi ou último valor disponível</small></div>
+  <div><span>SALDO NA CORRETORA</span><strong>{{ broker_balance|brl }}</strong><small>Disponível após operações</small></div>
+</section>
+
+<section class="investment-metrics">
+  <article><span>Custo da posição atual</span><strong>{{ portfolio_cost|brl }}</strong></article>
+  <article><span>Resultado da carteira</span><strong class="{{ 'positive' if portfolio_pnl >= 0 else 'negative' }}">{{ portfolio_pnl|brl }}</strong><small>{% if portfolio_return_pct is not none %}{{ portfolio_return_pct }}% sobre o custo{% else %}Sem posição aberta{% endif %}</small></article>
+  <article><span>Recebimentos</span><strong>{{ total_receipts|brl }}</strong></article>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><div><span>COTAÇÕES AUTOMÁTICAS</span><h2>{{ 'Brapi conectada' if brapi_configured else 'Conectar à Brapi' }}</h2></div><span class="operation-chip {{ 'compra' if brapi_configured else 'venda' }}">{{ 'Ativa' if brapi_configured else 'Pendente' }}</span></div>
+  {% if brapi_configured %}
+    <p class="helper-text">As cotações são verificadas ao abrir esta página e reutilizadas por 30 minutos. Sua chave fica criptografada e nunca é exibida.</p>
+    <div class="form-grid compact">
+      <form method="post" action="{{ url_for('main.configure_brapi') }}" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="password" name="token" placeholder="Substituir chave da Brapi" required autocomplete="off"><button class="secondary-button">Trocar chave</button></form>
+      <form method="post" action="{{ url_for('main.configure_brapi') }}" onsubmit="return confirm('Remover a atualização automática das cotações?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="clear"><button class="danger-link">Desconectar</button></form>
+    </div>
+  {% else %}
+    <p class="helper-text">Crie uma chave gratuita em <a href="https://brapi.dev/dashboard" target="_blank" rel="noopener">brapi.dev</a> e cole abaixo. A Brapi fornece somente dados públicos de mercado e não acessa sua corretora.</p>
+    <form method="post" action="{{ url_for('main.configure_brapi') }}" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="password" name="token" placeholder="Chave da Brapi" required autocomplete="off"><button class="primary-button">Conectar e validar</button></form>
+  {% endif %}
+</section>
+
+<section class="panel table-panel">
+  <div class="panel-head"><div><span>CARTEIRA ATUAL</span><h2>Posição, preço médio e rentabilidade</h2></div></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Ativo</th><th>Quantidade</th><th>Preço médio</th><th>Cotação</th><th>Valor atual</th><th>Resultado</th><th>Proventos</th><th>Atualização</th></tr></thead>
+    <tbody>{% for row in positions %}
+      <tr>
+        <td><strong>{{ row.asset }}</strong>{% if row.asset_name %}<small class="table-subtitle">{{ row.asset_name }}</small>{% endif %}</td>
+        <td>{{ ('%.8f'|format(row.quantity)).rstrip('0').rstrip('.') }}</td><td>{{ row.average|brl }}</td>
+        <td>{{ row.current_price|brl }}{% if row.change_percent is not none %}<small class="table-subtitle {{ 'positive' if row.change_percent >= 0 else 'negative' }}">{{ '+' if row.change_percent >= 0 else '' }}{{ '%.2f'|format(row.change_percent) }}% hoje</small>{% endif %}</td>
+        <td>{{ row.current_value|brl }}</td><td class="{{ 'positive' if row.pnl >= 0 else 'negative' }}">{{ row.pnl|brl }}{% if row.return_pct is not none %}<small class="table-subtitle">{{ row.return_pct }}%</small>{% endif %}</td><td>{{ row.receipts|brl }}</td>
+        <td>{% if row.quote_source == 'brapi' %}<strong>Automática</strong>{% elif row.quote_source == 'manual' %}<strong>Manual</strong>{% else %}<strong>Preço médio</strong>{% endif %}<small class="table-subtitle">{{ row.updated_at.strftime('%d/%m/%Y %H:%M') if row.updated_at else 'Ainda não consultada' }}</small><form method="post" action="{{ url_for('main.update_asset_price') }}" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="asset" value="{{ row.asset }}"><input name="current_price" placeholder="Cotação manual"><button class="secondary-button">Salvar</button></form></td>
+      </tr>
+    {% else %}<tr><td colspan="8" class="empty">Registre compras para formar a carteira.</td></tr>{% endfor %}</tbody>
+  </table></div>
+</section>
+
 <section class="panel form-panel" id="investment-form"><div class="panel-head"><div><span>NOVA MOVIMENTAÇÃO</span><h2>Registrar investimento</h2></div></div><form method="post" class="form-grid investment-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>Operação<select name="operation" required><option>Compra</option><option>Venda</option><option>Recebimento</option></select></label><label>Categoria<input name="category" required placeholder="Ex.: Renda variável"></label><label>Subcategoria<input name="subcategory" placeholder="Ex.: Fundo imobiliário"></label><label>Ativo<input name="asset" required placeholder="Ex.: RZAG11"></label><label>Quantidade<input name="quantity" required inputmode="decimal" placeholder="1"></label><label>Valor unitário<input name="unit_value" required inputmode="decimal" placeholder="0,00"></label><label>Data<input type="date" name="operation_date" value="{{ today.isoformat() }}" required></label><label>Observações<input name="notes" placeholder="Opcional"></label><div class="form-actions span-2"><button class="primary-button">Salvar operação</button></div></form></section>
+
 <section class="panel filter-panel"><form method="get" class="filter-row"><label>De<input type="date" name="start" value="{{ filters.start }}"></label><label>Até<input type="date" name="end" value="{{ filters.end }}"></label><label>Categoria<select name="category"><option value="">Todas</option>{% for value in categories %}<option {{ 'selected' if filters.category == value }}>{{ value }}</option>{% endfor %}</select></label><label>Subcategoria<select name="subcategory"><option value="">Todas</option>{% for value in subcategories %}<option {{ 'selected' if filters.subcategory == value }}>{{ value }}</option>{% endfor %}</select></label><button class="secondary-button">Filtrar</button><a href="{{ url_for('main.investments') }}">Limpar</a></form></section>
+
 <section class="panel table-panel"><div class="panel-head"><div><span>HISTÓRICO</span><h2>Operações registradas</h2></div></div><div class="table-wrap"><table><thead><tr><th>Data</th><th>Operação</th><th>Ativo</th><th>Categoria</th><th>Quantidade</th><th>Valor unitário</th><th>Total</th><th></th></tr></thead><tbody>{% for item in investments %}<tr><td>{{ item.operation_date.strftime('%d/%m/%Y') }}</td><td><span class="operation-chip {{ item.operation|lower }}">{{ item.operation }}</span></td><td><strong>{{ item.asset }}</strong></td><td>{{ item.category }}{% if item.subcategory %}<small class="table-subtitle">{{ item.subcategory }}</small>{% endif %}</td><td>{{ ('%.8f'|format(item.quantity)).rstrip('0').rstrip('.') }}</td><td>{{ item.unit_value|brl }}</td><td class="money">{{ item.total_value|brl }}</td><td><div class="row-actions"><a href="{{ url_for('main.edit_investment', item_id=item.id) }}">Editar</a><form method="post" action="{{ url_for('main.delete_investment', item_id=item.id) }}" onsubmit="return confirm('Excluir esta operação?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="danger-link">Excluir</button></form></div></td></tr>{% else %}<tr><td colspan="8" class="empty">Nenhum investimento registrado.</td></tr>{% endfor %}</tbody></table></div></section>
-<script>document.querySelector('[data-open]').addEventListener('click',()=>document.getElementById('investment-form').scrollIntoView({behavior:'smooth'}))</script>{% endblock %}
+<script>document.querySelector('[data-open]').addEventListener('click',()=>document.getElementById('investment-form').scrollIntoView({behavior:'smooth'}))</script>
+{% endblock %}
