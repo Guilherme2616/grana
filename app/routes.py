@@ -317,12 +317,48 @@ def investment_position():
 
 def cash_balance():
     initial = money(db.session.query(func.sum(Account.initial_balance)).filter(Account.active.is_(True)).scalar())
-    account_rows = Transaction.query.filter(Transaction.card_id.is_(None)).all()
+    account_rows = Transaction.query.filter(
+        Transaction.card_id.is_(None),
+        Transaction.status == "confirmed",
+        Transaction.transaction_date <= date.today(),
+    ).all()
     income = sum((money(item.amount) for item in account_rows if item.kind == "income"), Decimal("0"))
     refunds = sum((money(item.amount) for item in account_rows if item.kind == "refund"), Decimal("0"))
     expenses = sum((money(item.amount) for item in account_rows if item.kind == "expense"), Decimal("0"))
-    invoice_payments = sum((money(item.amount) for item in InvoicePayment.query.filter_by(paid_by="self").all()), Decimal("0"))
+    invoice_payments = sum((money(item.amount) for item in InvoicePayment.query.filter(
+        InvoicePayment.paid_by == "self",
+        InvoicePayment.payment_date <= date.today(),
+    ).all()), Decimal("0"))
     return initial + income + refunds - expenses - invoice_payments
+
+
+def outstanding_card_commitment():
+    """Valor pessoal ainda comprometido nos cartões, sem duplicar a baixa."""
+    total = Decimal("0")
+    for invoice in Invoice.query.filter_by(status="confirmed").all():
+        personal_total = sum((
+            money(item.amount if item.personal_amount is None else item.personal_amount)
+            for item in invoice.items if item.selected
+        ), Decimal("0"))
+        self_paid = sum((
+            money(payment.amount) for payment in invoice.payments
+            if payment.paid_by == "self" and payment.payment_date <= date.today()
+        ), Decimal("0"))
+        total += max(personal_total - self_paid, Decimal("0"))
+
+    manual_card_rows = Transaction.query.filter(
+        Transaction.card_id.isnot(None),
+        Transaction.invoice_item_id.is_(None),
+        Transaction.status == "confirmed",
+        Transaction.transaction_date <= date.today(),
+    ).all()
+    total += sum((personal_value(item) for item in manual_card_rows if item.kind == "expense"), Decimal("0"))
+    total -= sum((personal_value(item) for item in manual_card_rows if item.kind == "refund"), Decimal("0"))
+    return max(total, Decimal("0"))
+
+
+def transaction_reference_month(item):
+    return item.competence_month or item.transaction_date.strftime("%Y-%m")
 
 
 def future_invoice_rows(base_month, months=12):
@@ -337,6 +373,16 @@ def future_invoice_rows(base_month, months=12):
     )
     projection = build_installment_projection(installment_items, base_month, months)
     cards = {card.id: card for card in CreditCard.query.filter_by(active=True).all()}
+    cashflow = {}
+    for item in Transaction.query.all():
+        reference = transaction_reference_month(item)
+        values = cashflow.setdefault(reference, {"income": Decimal("0"), "other_expenses": Decimal("0")})
+        if item.kind == "income":
+            values["income"] += money(item.amount)
+        elif item.card_id is None and item.kind == "expense":
+            values["other_expenses"] += personal_value(item)
+        elif item.card_id is None and item.kind == "refund":
+            values["other_expenses"] -= personal_value(item)
 
     known = {}
     known_invoices = Invoice.query.filter(
@@ -369,12 +415,32 @@ def future_invoice_rows(base_month, months=12):
             "amount": amount,
             "confirmed": (reference, card_id) in known,
         } for card_id, amount in sorted(per_card.items(), key=lambda pair: pair[1], reverse=True)]
+        card_total = sum(per_card.values(), Decimal("0"))
+        month_cashflow = cashflow.get(reference, {"income": Decimal("0"), "other_expenses": Decimal("0")})
+        income = month_cashflow["income"]
+        other_expenses = month_cashflow["other_expenses"]
+        expenses_total = card_total + other_expenses
+        spending_groups = list(card_values)
+        if other_expenses:
+            spending_groups.append({
+                "id": None,
+                "name": "Demais gastos",
+                "color": "#8E8D8A",
+                "amount": other_expenses,
+                "confirmed": True,
+            })
         rows.append({
             "reference_month": reference,
             "label": month_label(reference),
             "short_label": month_label(reference, short=True),
-            "total": sum(per_card.values(), Decimal("0")),
+            "total": expenses_total,
+            "card_total": card_total,
+            "income": income,
+            "other_expenses": other_expenses,
+            "expenses_total": expenses_total,
+            "net": income - expenses_total,
             "cards": card_values,
+            "spending_groups": spending_groups,
             "details": details,
         })
     return rows
@@ -411,14 +477,30 @@ def logout():
 @login_required
 def dashboard():
     today = date.today()
-    reference_month = today.strftime("%Y-%m")
-    base = [item for item in Transaction.query.all() if (item.competence_month or item.transaction_date.strftime("%Y-%m")) == reference_month]
+    all_transactions = Transaction.query.all()
+    reference_month = request.args.get("month") or today.strftime("%Y-%m")
+    try:
+        month_bounds(reference_month)
+    except (ValueError, IndexError):
+        reference_month = today.strftime("%Y-%m")
+    if not request.args.get("month") and all_transactions:
+        current_rows = [item for item in all_transactions if transaction_reference_month(item) == reference_month]
+        if not current_rows:
+            reference_month = max(transaction_reference_month(item) for item in all_transactions)
+    base = [item for item in all_transactions if transaction_reference_month(item) == reference_month]
     income = sum((money(item.amount) for item in base if item.kind == "income"), Decimal("0"))
     expenses = sum((personal_value(item) for item in base if item.kind == "expense"), Decimal("0")) - sum((personal_value(item) for item in base if item.kind == "refund"), Decimal("0"))
-    balance = cash_balance()
+    cash = cash_balance()
+    card_commitment = outstanding_card_commitment()
+    balance = cash - card_commitment
     next_invoice = Invoice.query.filter_by(status="confirmed").order_by(Invoice.reference_month.desc()).first()
     transactions = Transaction.query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).limit(5).all()
-    return render_template("dashboard.html", balance=balance, income=income, expenses=expenses, next_invoice=next_invoice, transactions=transactions, today=today)
+    return render_template(
+        "dashboard.html", balance=balance, cash=cash, card_commitment=card_commitment,
+        income=income, expenses=expenses, reference_month=reference_month,
+        month_name=month_label(reference_month), next_invoice=next_invoice,
+        transactions=transactions, today=today,
+    )
 
 
 @main.get("/indicadores")
@@ -543,20 +625,29 @@ def future_invoices():
     except (ValueError, IndexError):
         base_month = date.today().strftime("%Y-%m")
     rows = future_invoice_rows(base_month, 12)
-    total = sum((row["total"] for row in rows), Decimal("0"))
-    next_three = sum((row["total"] for row in rows[:3]), Decimal("0"))
-    largest = max(rows, key=lambda row: row["total"]) if rows else None
+    total = sum((row["expenses_total"] for row in rows), Decimal("0"))
+    total_income = sum((row["income"] for row in rows), Decimal("0"))
+    total_net = total_income - total
+    next_three = sum((row["expenses_total"] for row in rows[:3]), Decimal("0"))
     card_totals = {}
     for row in rows:
         for card in row["cards"]:
             card_totals.setdefault(card["name"], {"amount": Decimal("0"), "color": card["color"]})
             card_totals[card["name"]]["amount"] += card["amount"]
+        if row["other_expenses"]:
+            card_totals.setdefault("Demais gastos", {"amount": Decimal("0"), "color": "#8E8D8A"})
+            card_totals["Demais gastos"]["amount"] += row["other_expenses"]
     chart_data = {
         "labels": [row["short_label"] for row in rows],
-        "values": [float(row["total"]) for row in rows],
+        "expenses": [float(row["expenses_total"]) for row in rows],
+        "income": [float(row["income"]) for row in rows],
         "cards": [{"name": name, "amount": float(value["amount"]), "color": value["color"]} for name, value in card_totals.items()],
     }
-    return render_template("future_invoices.html", base_month=base_month, rows=rows, total=total, next_three=next_three, largest=largest, chart_data=chart_data)
+    return render_template(
+        "future_invoices.html", base_month=base_month, rows=rows, total=total,
+        total_income=total_income, total_net=total_net, next_three=next_three,
+        chart_data=chart_data,
+    )
 
 
 @main.route("/movimentacoes", methods=["GET", "POST"])
