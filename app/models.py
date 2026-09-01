@@ -201,6 +201,17 @@ class AssetPrice(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     asset = db.Column(db.String(30), unique=True, nullable=False)
     current_price = db.Column(db.Numeric(14, 2), nullable=False)
+    asset_name = db.Column(db.String(120), default="", nullable=False)
+    change_percent = db.Column(db.Numeric(10, 4), nullable=True)
+    source = db.Column(db.String(30), default="manual", nullable=False)
+    last_attempt_at = db.Column(db.DateTime, nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class IntegrationSetting(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(60), unique=True, nullable=False)
+    encrypted_value = db.Column(db.Text, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
