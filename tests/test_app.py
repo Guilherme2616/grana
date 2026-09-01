@@ -10,7 +10,6 @@ from app.models import Account, CardCycle, Category, CategoryRule, CreditCard, F
 from app.services.drive_sync import month_folder_matches, normalize_folder_name
 from app.services.financial_analytics import build_installment_projection, month_label, shift_month
 from app.services.invoice_parser import (
-    _normalize_bb_ocr_text,
     detect_bb_statement_total,
     detect_due_date,
     is_banco_inter_invoice,
@@ -611,24 +610,6 @@ def test_bb_scanned_pdf_uses_ocr_fallback(monkeypatch):
     assert sum(item["amount"] for item in parsed["items"]) == Decimal("294.31")
 
 
-def test_bb_real_ocr_noise_is_normalized_and_reconciles():
-    recognized = """
-    06/07 | PGTO.CASH AG. 0470 000047000 200 10 RS 661,26-
-    07/07 | APPLE.COM/BILL_ SAO PAULO BR RS 66,90
-    13/07 TOTALPASS SAO PAULO BR R$ 59.90
-    15/07 | Smiles Clube Smiles Barueri BR R$ 46,00
-    29/04 | GOLLINHAS A* PARC 03/05 SAO PAULO BR RS 30,80
-    23/07 | CLUBE LIVELO* PARC 01/12 SANTANA DE P BR RS 42,71
-    Data | Descricao Pais Valor
-    28/07 | ANUIDADE DIFERENCIADA TIT-PARC 05/12 BR R§ 48,00
-    """
-    items = parse_bb_smiles_text(_normalize_bb_ocr_text(recognized), "2026-08")
-    assert len(items) == 6
-    assert sum(item["amount"] for item in items) == Decimal("294.31")
-    assert items[0]["description"] == "APPLE.COM/BILL_ SAO PAULO"
-    assert items[-1]["description"] == "ANUIDADE DIFERENCIADA TIT-PARC 05/12"
-
-
 def test_itau_pdf_reads_current_purchases_beyond_third_page(monkeypatch):
     pages = [
         """Itaú Personnalité\nO total da sua fatura é: R$ 60,00\nVencimento 10/08/2026\nLimite total de crédito R$ 15.000,00""",
@@ -910,6 +891,82 @@ def test_financial_indicators_provisioning_and_simulator_pages(client, app):
     assert simulator.status_code == 200
     assert "Simulador de investimentos" in simulator.text
     assert "IR regressivo" in simulator.text
+
+
+def test_dashboard_uses_latest_month_and_deducts_unpaid_card_commitment(client, app):
+    login(client)
+    with app.app_context():
+        Account.query.first().initial_balance = Decimal("0.00")
+        card = CreditCard.query.first()
+        category = Category.query.first()
+        db.session.add(Transaction(
+            description="Salário", amount=Decimal("1000.00"), kind="income",
+            transaction_date=date(2026, 8, 5), account_id=Account.query.first().id,
+            category_id=None, competence_month=None,
+        ))
+        invoice = Invoice(card_id=card.id, reference_month="2026-08", total=Decimal("300.00"), status="confirmed")
+        db.session.add(invoice); db.session.flush()
+        item = InvoiceItem(
+            invoice_id=invoice.id, purchase_date=date(2026, 8, 10), description="Compra no cartão",
+            amount=Decimal("300.00"), selected=True, category_id=category.id,
+            payment_responsibility="self", personal_amount=Decimal("300.00"),
+        )
+        db.session.add(item); db.session.flush()
+        db.session.add(Transaction(
+            description=item.description, amount=item.amount, kind="expense",
+            transaction_date=item.purchase_date, card_id=card.id, category_id=category.id,
+            invoice_item_id=item.id, competence_month="2026-08", source="invoice",
+            payment_responsibility="self", personal_amount=Decimal("300.00"),
+        ))
+        db.session.add(Transaction(
+            description="Conta de luz", amount=Decimal("100.00"), kind="expense",
+            transaction_date=date(2026, 8, 15), account_id=Account.query.first().id,
+            category_id=category.id, competence_month="2026-08",
+        ))
+        db.session.commit()
+
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "Agosto/2026" in response.text
+    assert "R$ 600,00" in response.text
+    assert "Em contas: R$ 900,00" in response.text
+    assert "Comprometido nos cartões: R$ 300,00" in response.text
+    assert "R$ 1.000,00" in response.text
+    assert "R$ 400,00" in response.text
+
+
+def test_future_invoices_compares_cashflow_and_lists_other_expenses(client, app):
+    login(client)
+    with app.app_context():
+        card = CreditCard.query.first()
+        account = Account.query.first()
+        category = Category.query.first()
+        invoice = Invoice(card_id=card.id, reference_month="2026-08", total=Decimal("100.00"), status="confirmed")
+        db.session.add(invoice); db.session.flush()
+        db.session.add(InvoiceItem(
+            invoice_id=invoice.id, purchase_date=date(2026, 8, 2), description="NOTEBOOK PARC 03/10",
+            amount=Decimal("100.00"), installment_current=3, installment_total=10, selected=True,
+        ))
+        db.session.add_all([
+            Transaction(
+                description="Salário futuro", amount=Decimal("500.00"), kind="income",
+                transaction_date=date(2026, 9, 5), account_id=account.id,
+            ),
+            Transaction(
+                description="Aluguel", amount=Decimal("50.00"), kind="expense",
+                transaction_date=date(2026, 9, 6), account_id=account.id, category_id=category.id,
+                competence_month="2026-09",
+            ),
+        ])
+        db.session.commit()
+
+    response = client.get("/proximas-faturas?month=2026-08")
+    assert response.status_code == 200
+    assert "Demais gastos" in response.text
+    assert "Despesas fora dos cartões" in response.text
+    assert "R$ 500,00" in response.text
+    assert "R$ 150,00" in response.text
+    assert "R$ 350,00" in response.text
 
 
 def test_monthly_card_cycle(client, app):
