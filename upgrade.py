@@ -55,6 +55,12 @@ with app.app_context():
             "fees": "ALTER TABLE investment ADD COLUMN fees NUMERIC(12, 2) DEFAULT 0 NOT NULL",
             "benchmark": "ALTER TABLE investment ADD COLUMN benchmark VARCHAR(20) DEFAULT 'CDI' NOT NULL",
         },
+        "asset_price": {
+            "asset_name": "ALTER TABLE asset_price ADD COLUMN asset_name VARCHAR(120) DEFAULT '' NOT NULL",
+            "change_percent": "ALTER TABLE asset_price ADD COLUMN change_percent NUMERIC(10, 4)",
+            "source": "ALTER TABLE asset_price ADD COLUMN source VARCHAR(30) DEFAULT 'manual' NOT NULL",
+            "last_attempt_at": "ALTER TABLE asset_price ADD COLUMN last_attempt_at DATETIME",
+        },
     }
     for table_name, columns in migrations.items():
         existing = {column["name"] for column in inspector.get_columns(table_name)}
