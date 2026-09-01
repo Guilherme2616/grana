@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 
@@ -6,7 +6,7 @@ import pytest
 
 from app import create_app
 from app.extensions import db
-from app.models import Account, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
+from app.models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, IntegrationSetting, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
 from app.services.drive_sync import month_folder_matches, normalize_folder_name
 from app.services.financial_analytics import build_installment_projection, month_label, shift_month
 from app.services.invoice_parser import (
@@ -27,6 +27,7 @@ from app.services.invoice_parser import (
     parse_itau_text,
     parse_invoice_pdf,
 )
+from app.services.market_data import fetch_brapi_quote
 from app.services.secret_store import decrypt_secret
 
 
@@ -97,10 +98,10 @@ def test_card_competence_responsibility_and_invoice_payment_cash(client, app):
         db.session.add(invoice); db.session.commit(); invoice_id = invoice.id
 
     client.post(f"/faturas/{invoice_id}/pagamentos", data={
-        "amount": "60,00", "payment_date": "2026-09-28", "paid_by": "self", "account_id": ids[0],
+        "amount": "60,00", "payment_date": date.today().isoformat(), "paid_by": "self", "account_id": ids[0],
     }, follow_redirects=True)
     client.post(f"/faturas/{invoice_id}/pagamentos", data={
-        "amount": "40,00", "payment_date": "2026-09-28", "paid_by": "parents",
+        "amount": "40,00", "payment_date": date.today().isoformat(), "paid_by": "parents",
     }, follow_redirects=True)
     with app.app_context():
         payments = InvoicePayment.query.order_by(InvoicePayment.id).all()
@@ -994,3 +995,87 @@ def test_create_investment(client, app):
     assert "RZAG11" in response.text
     with app.app_context():
         assert Investment.query.first().total_value == Decimal("95.0000000000")
+
+
+def test_brapi_quote_parser(monkeypatch):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"results": [{"symbol": "RZAG11", "data": {
+                "shortName": "Riza Agro FIAGRO",
+                "regularMarketPrice": 8.73,
+                "regularMarketChangePercent": -0.42,
+            }}]}
+
+    monkeypatch.setattr("app.services.market_data.requests.get", lambda *args, **kwargs: Response())
+    quote = fetch_brapi_quote("rzag11", "token-seguro")
+    assert quote["asset"] == "RZAG11"
+    assert quote["price"] == Decimal("8.73")
+    assert quote["change_percent"] == Decimal("-0.42")
+
+
+def test_brapi_configuration_auto_refresh_and_cache(client, app, monkeypatch):
+    login(client)
+    calls = []
+
+    def fake_quote(asset, token):
+        calls.append((asset, token))
+        return {
+            "asset": asset,
+            "name": "Riza Agro FIAGRO",
+            "price": Decimal("8.73"),
+            "change_percent": Decimal("1.25"),
+        }
+
+    monkeypatch.setattr("app.routes.fetch_brapi_quote", fake_quote)
+    with app.app_context():
+        db.session.add(Investment(
+            operation="Compra", category="Renda variável", subcategory="FII",
+            asset="RZAG11", quantity=10, unit_value=Decimal("9.50"),
+            operation_date=date(2026, 8, 20),
+        ))
+        db.session.commit()
+
+    response = client.post("/investimentos/brapi", data={"token": "token-seguro"}, follow_redirects=True)
+    assert response.status_code == 200
+    assert "Brapi conectada" in response.text
+    assert "R$ 87,30" in response.text
+    assert "1.25% hoje" in response.text
+    with app.app_context():
+        setting = IntegrationSetting.query.filter_by(key="brapi_token").one()
+        assert setting.encrypted_value != "token-seguro"
+        assert decrypt_secret(setting.encrypted_value) == "token-seguro"
+        price = AssetPrice.query.filter_by(asset="RZAG11").one()
+        assert price.current_price == Decimal("8.73")
+        assert price.source == "brapi"
+
+    call_count = len(calls)
+    response = client.get("/investimentos")
+    assert response.status_code == 200
+    assert len(calls) == call_count
+
+
+def test_brapi_manual_refresh_ignores_cache(client, app, monkeypatch):
+    login(client)
+    calls = []
+
+    def fake_quote(asset, token):
+        calls.append(asset)
+        return {"asset": asset, "name": asset, "price": Decimal("10.25"), "change_percent": None}
+
+    monkeypatch.setattr("app.routes.fetch_brapi_quote", fake_quote)
+    with app.app_context():
+        from app.services.secret_store import encrypt_secret
+        db.session.add_all([
+            Investment(operation="Compra", category="Renda variável", asset="BOVA11", quantity=2, unit_value=Decimal("10.00"), operation_date=date.today()),
+            IntegrationSetting(key="brapi_token", encrypted_value=encrypt_secret("token")),
+            AssetPrice(asset="BOVA11", current_price=Decimal("10.00"), last_attempt_at=datetime.utcnow(), source="brapi"),
+        ])
+        db.session.commit()
+
+    response = client.post("/investimentos/cotacoes/atualizar", follow_redirects=True)
+    assert response.status_code == 200
+    assert "1 cotação(ões) atualizada(s) pela Brapi" in response.text
+    assert calls == ["BOVA11"]
