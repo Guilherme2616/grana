@@ -1,11 +1,11 @@
 import hashlib
 import re
+import shutil
+import subprocess
+import tempfile
 import unicodedata
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-
-import pdfplumber
-
 
 DATE_HEADING = re.compile(
     r"(?m)^\s*(?P<day>\d{1,2})\s+de\s+(?P<month>[A-Za-zÀ-ÿ]+)\s+de\s+(?P<year>\d{4})\s*$",
@@ -49,13 +49,28 @@ def _decimal(value):
 
 
 def _extract_text(stream):
+    executable = shutil.which("pdftotext")
+    if not executable:
+        raise DividendStatementError("O leitor de PDF do servidor não está disponível.")
     try:
         stream.seek(0)
-        with pdfplumber.open(stream) as document:
-            pages = [page.extract_text(layout=True) or "" for page in document.pages]
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as source:
+            source.write(stream.read())
+            source.flush()
+            completed = subprocess.run(
+                [executable, "-layout", source.name, "-"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        if completed.returncode != 0:
+            raise DividendStatementError("Não foi possível extrair o texto do PDF da B3.")
+        text = completed.stdout
     except Exception as exc:
+        if isinstance(exc, DividendStatementError):
+            raise
         raise DividendStatementError("Não foi possível abrir o extrato da B3.") from exc
-    text = "\n".join(pages)
     if "Extrato de Movimentação" not in text or "Proventos recebidos" not in text:
         raise DividendStatementError("Este PDF não parece ser um extrato de proventos recebidos da B3.")
     return text
