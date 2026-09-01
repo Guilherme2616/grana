@@ -7,6 +7,7 @@
     {% if brapi_configured %}
     <form method="post" action="{{ url_for('main.refresh_investment_prices') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="secondary-button">↻ Atualizar agora</button></form>
     {% endif %}
+    <a class="secondary-button" href="{{ url_for('main.dividends') }}">Ver proventos</a>
     <a class="secondary-button" href="{{ url_for('main.investment_simulator') }}">Simular crescimento</a>
     <button class="primary-button" data-open="investment-form">＋ Nova operação</button>
   </div>

@@ -11,14 +11,16 @@ from flask_login import current_user, login_required, login_user, logout_user
 from sqlalchemy import extract, func
 
 from .extensions import db
-from .models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, IntegrationSetting, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
+from .models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, DividendImport, DividendIncome, FinancialGoal, IntegrationSetting, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
 from .services.drive_sync import (
     DriveAccessError,
     DriveConfigurationError,
     download_pdf,
     drive_is_configured,
+    list_dividend_pdfs,
     list_month_pdfs,
 )
+from .services.dividend_parser import DividendStatementError, parse_b3_dividend_pdf
 from .services.financial_analytics import (
     build_installment_projection,
     month_bounds,
@@ -314,7 +316,8 @@ def integration_secret(key):
     return decrypt_secret(setting.encrypted_value) if setting else ""
 
 
-def build_investment_positions(items):
+def build_investment_positions(items, imported_receipts=None):
+    imported_receipts = imported_receipts or {}
     positions = []
     for asset in sorted({row.asset for row in items if row.operation in {"Compra", "Venda"}}):
         asset_rows = [row for row in items if row.asset == asset]
@@ -332,6 +335,7 @@ def build_investment_positions(items):
         invested_cost = quantity * average
         pnl = current_value - invested_cost
         receipts = sum((row.total_value for row in asset_rows if row.operation == "Recebimento"), Decimal("0"))
+        receipts += money(imported_receipts.get(asset))
         positions.append({
             "asset": asset,
             "asset_name": quote.asset_name if quote else "",
@@ -1541,13 +1545,21 @@ def investments():
     refresh_asset_quotes(position_assets)
     total_buys = sum((item.total_value for item in all_items if item.operation == "Compra"), Decimal("0"))
     total_sales = sum((item.total_value for item in all_items if item.operation == "Venda"), Decimal("0"))
-    total_receipts = sum((item.total_value for item in all_items if item.operation == "Recebimento"), Decimal("0"))
+    manual_receipts = sum((item.total_value for item in all_items if item.operation == "Recebimento"), Decimal("0"))
+    confirmed_dividends = DividendIncome.query.join(DividendImport).filter(
+        DividendImport.status == "confirmed",
+        DividendIncome.selected.is_(True),
+    ).all()
+    imported_receipts = {}
+    for dividend in confirmed_dividends:
+        imported_receipts[dividend.asset] = imported_receipts.get(dividend.asset, Decimal("0")) + money(dividend.amount)
+    total_receipts = manual_receipts + sum(imported_receipts.values(), Decimal("0"))
     investment_categories = Category.query.filter(func.lower(Category.name).in_(["investimento", "investimentos"])).all()
     category_ids = [item.id for item in investment_categories]
     total_transferred = money(db.session.query(func.sum(Transaction.amount)).filter(Transaction.kind == "expense", Transaction.category_id.in_(category_ids)).scalar()) if category_ids else Decimal("0")
     invested_value = total_buys - total_sales
     broker_balance = total_transferred - total_buys + total_sales + total_receipts
-    positions = build_investment_positions(all_items)
+    positions = build_investment_positions(all_items, imported_receipts)
     portfolio_value = sum((row["current_value"] for row in positions), Decimal("0"))
     portfolio_cost = sum((row["invested_cost"] for row in positions), Decimal("0"))
     portfolio_pnl = portfolio_value - portfolio_cost
@@ -1563,6 +1575,177 @@ def investments():
         categories=categories, subcategories=subcategories,
         filters={"start":start,"end":end,"category":category,"subcategory":subcategory},
     )
+
+
+@main.get("/investimentos/proventos")
+@login_required
+def dividends():
+    query = DividendIncome.query.join(DividendImport).filter(
+        DividendImport.status == "confirmed",
+        DividendIncome.selected.is_(True),
+    )
+    start = request.args.get("start", "")
+    end = request.args.get("end", "")
+    asset = request.args.get("asset", "").strip().upper()
+    income_type = request.args.get("income_type", "")
+    if start:
+        try:
+            query = query.filter(DividendIncome.payment_date >= datetime.strptime(start, "%Y-%m-%d").date())
+        except ValueError:
+            pass
+    if end:
+        try:
+            query = query.filter(DividendIncome.payment_date <= datetime.strptime(end, "%Y-%m-%d").date())
+        except ValueError:
+            pass
+    if asset:
+        query = query.filter(DividendIncome.asset == asset)
+    if income_type:
+        query = query.filter(DividendIncome.income_type == income_type)
+
+    items = query.order_by(DividendIncome.payment_date.desc(), DividendIncome.id.desc()).all()
+    total = sum((money(item.amount) for item in items), Decimal("0"))
+    today = date.today()
+    year_total = sum((money(item.amount) for item in items if item.payment_date.year == today.year), Decimal("0"))
+    month_total = sum((money(item.amount) for item in items if item.payment_date.year == today.year and item.payment_date.month == today.month), Decimal("0"))
+    asset_totals = {}
+    for item in items:
+        asset_totals[item.asset] = asset_totals.get(item.asset, Decimal("0")) + money(item.amount)
+    top_assets = sorted(asset_totals.items(), key=lambda row: row[1], reverse=True)[:5]
+    all_confirmed = DividendIncome.query.join(DividendImport).filter(
+        DividendImport.status == "confirmed",
+        DividendIncome.selected.is_(True),
+    )
+    assets = [row[0] for row in all_confirmed.with_entities(DividendIncome.asset).distinct().order_by(DividendIncome.asset).all()]
+    income_types = [row[0] for row in all_confirmed.with_entities(DividendIncome.income_type).distinct().order_by(DividendIncome.income_type).all()]
+    pending_imports = DividendImport.query.filter_by(status="draft").order_by(DividendImport.created_at.desc()).all()
+    completed_imports = DividendImport.query.filter_by(status="confirmed").order_by(DividendImport.confirmed_at.desc()).limit(10).all()
+    return render_template(
+        "dividends.html",
+        dividends=items,
+        now_year=today.year,
+        total=total,
+        year_total=year_total,
+        month_total=month_total,
+        top_assets=top_assets,
+        assets=assets,
+        income_types=income_types,
+        pending_imports=pending_imports,
+        completed_imports=completed_imports,
+        drive_configured=drive_is_configured(),
+        filters={"start": start, "end": end, "asset": asset, "income_type": income_type},
+    )
+
+
+@main.post("/investimentos/proventos/sincronizar-drive")
+@login_required
+def sync_drive_dividends():
+    try:
+        drive_session, files = list_dividend_pdfs()
+    except (DriveConfigurationError, DriveAccessError) as exc:
+        flash(str(exc) or "Não foi possível consultar a pasta de proventos.", "danger")
+        return redirect(url_for("main.dividends"))
+
+    results = []
+    for drive_file in files:
+        filename = drive_file["name"]
+        existing_import = DividendImport.query.filter_by(drive_file_id=drive_file["id"]).first()
+        if existing_import:
+            if existing_import.status == "draft":
+                results.append({
+                    "filename": filename,
+                    "status": "Aguardando revisão",
+                    "tone": "warning",
+                    "detail": f"{len(existing_import.items)} proventos aguardam confirmação.",
+                    "import_id": existing_import.id,
+                })
+            else:
+                results.append({"filename": filename, "status": "Já importado", "tone": "muted", "detail": "Nenhuma duplicação foi criada."})
+            continue
+        try:
+            parsed = parse_b3_dividend_pdf(download_pdf(drive_session, drive_file["id"]))
+            fingerprints = {item.fingerprint for item in DividendIncome.query.with_entities(DividendIncome.fingerprint).all()}
+            seen = set()
+            new_items = []
+            for item in parsed["items"]:
+                if item["fingerprint"] not in fingerprints and item["fingerprint"] not in seen:
+                    new_items.append(item)
+                    seen.add(item["fingerprint"])
+            dividend_import = DividendImport(
+                original_filename=filename,
+                drive_file_id=drive_file["id"],
+                period_start=parsed["period_start"],
+                period_end=parsed["period_end"],
+                status="draft" if new_items else "confirmed",
+                confirmed_at=None if new_items else datetime.utcnow(),
+            )
+            db.session.add(dividend_import)
+            db.session.flush()
+            for item in new_items:
+                db.session.add(DividendIncome(
+                    import_id=dividend_import.id,
+                    income_type=item["income_type"],
+                    asset=item["asset"],
+                    asset_name=item["asset_name"],
+                    institution=item["institution"],
+                    quantity=item["quantity"],
+                    unit_value=item["unit_value"],
+                    amount=item["amount"],
+                    payment_date=item["payment_date"],
+                    fingerprint=item["fingerprint"],
+                ))
+            db.session.commit()
+            if new_items:
+                amount = sum((item["amount"] for item in new_items), Decimal("0"))
+                results.append({
+                    "filename": filename,
+                    "status": "Pronto para revisar",
+                    "tone": "success",
+                    "detail": f"{len(new_items)} proventos novos · R$ {amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                    "import_id": dividend_import.id,
+                })
+            else:
+                results.append({"filename": filename, "status": "Sem novidades", "tone": "muted", "detail": "Todos os registros desse PDF já estavam no Grana."})
+        except (DividendStatementError, DriveAccessError, ValueError) as exc:
+            db.session.rollback()
+            results.append({"filename": filename, "status": "Não importado", "tone": "danger", "detail": str(exc)})
+        except Exception:
+            db.session.rollback()
+            results.append({"filename": filename, "status": "Não importado", "tone": "danger", "detail": "O extrato não pôde ser processado."})
+
+    if not files:
+        results.append({"filename": "—", "status": "Pasta vazia", "tone": "muted", "detail": "Adicione um extrato de Movimentação da B3 em PDF."})
+    return render_template("sync_dividend_results.html", results=results)
+
+
+@main.route("/investimentos/proventos/importacoes/<int:import_id>/revisar", methods=["GET", "POST"])
+@login_required
+def review_dividend_import(import_id):
+    dividend_import = db.get_or_404(DividendImport, import_id)
+    if dividend_import.status != "draft":
+        return redirect(url_for("main.dividends"))
+    if request.method == "POST":
+        selected_ids = {int(value) for value in request.form.getlist("selected")}
+        for item in dividend_import.items:
+            item.selected = item.id in selected_ids
+        dividend_import.status = "confirmed"
+        dividend_import.confirmed_at = datetime.utcnow()
+        db.session.commit()
+        selected = [item for item in dividend_import.items if item.selected]
+        amount = sum((money(item.amount) for item in selected), Decimal("0"))
+        flash(f"{len(selected)} proventos confirmados, totalizando R$ {amount:,.2f}.".replace(",", "X").replace(".", ",").replace("X", "."), "success")
+        return redirect(url_for("main.dividends"))
+    return render_template("review_dividend_import.html", dividend_import=dividend_import)
+
+
+@main.post("/investimentos/proventos/importacoes/<int:import_id>/excluir")
+@login_required
+def delete_dividend_import(import_id):
+    dividend_import = db.get_or_404(DividendImport, import_id)
+    db.session.delete(dividend_import)
+    db.session.commit()
+    flash("Importação removida. O PDF poderá ser processado novamente.", "success")
+    return redirect(url_for("main.dividends"))
 
 
 @main.post("/investimentos/brapi")
