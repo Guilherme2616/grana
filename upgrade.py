@@ -80,6 +80,17 @@ with app.app_context():
     db.session.commit()
     db.session.execute(text("UPDATE credit_card SET institution = CASE invoice_provider WHEN 'bb_smiles' THEN 'Banco do Brasil' WHEN 'mercado_pago' THEN 'Mercado Pago' WHEN 'banco_inter' THEN 'Banco Inter' WHEN 'itau' THEN 'Itaú' ELSE institution END WHERE institution IS NULL OR institution = ''"))
     db.session.commit()
+    # Compras importadas pertencem ao mês em que foram consumidas. A fatura
+    # com vencimento em setembro, por exemplo, representa gastos de agosto.
+    # A expressão é idempotente: sempre deriva a competência da fatura.
+    db.session.execute(text(
+        "UPDATE \"transaction\" SET competence_month = ("
+        "SELECT strftime('%Y-%m', invoice.reference_month || '-01', '-1 month') "
+        "FROM invoice_item JOIN invoice ON invoice.id = invoice_item.invoice_id "
+        "WHERE invoice_item.id = \"transaction\".invoice_item_id"
+        ") WHERE invoice_item_id IS NOT NULL"
+    ))
+    db.session.commit()
     investment_category = Category.query.filter(
         db.func.lower(Category.name).in_(["investimento", "investimentos"])
     ).first()
