@@ -440,6 +440,19 @@ def transaction_reference_month(item):
     return item.competence_month or item.transaction_date.strftime("%Y-%m")
 
 
+def invoice_expense_month(reference_month):
+    """Competência econômica da fatura: mês anterior ao vencimento."""
+    return shift_month(reference_month, -1)
+
+
+def monthly_totals(rows, reference_month):
+    selected = [item for item in rows if transaction_reference_month(item) == reference_month]
+    income = sum((money(item.amount) for item in selected if item.kind == "income"), Decimal("0"))
+    expenses = sum((personal_value(item) for item in selected if item.kind == "expense"), Decimal("0"))
+    refunds = sum((personal_value(item) for item in selected if item.kind == "refund"), Decimal("0"))
+    return selected, income, expenses - refunds
+
+
 def future_invoice_rows(base_month, months=12):
     last_month = shift_month(base_month, months)
     installment_items = (
@@ -566,17 +579,76 @@ def dashboard():
         current_rows = [item for item in all_transactions if transaction_reference_month(item) == reference_month]
         if not current_rows:
             reference_month = max(transaction_reference_month(item) for item in all_transactions)
-    base = [item for item in all_transactions if transaction_reference_month(item) == reference_month]
-    income = sum((money(item.amount) for item in base if item.kind == "income"), Decimal("0"))
-    expenses = sum((personal_value(item) for item in base if item.kind == "expense"), Decimal("0")) - sum((personal_value(item) for item in base if item.kind == "refund"), Decimal("0"))
+    base, income, expenses = monthly_totals(all_transactions, reference_month)
+    previous_month = shift_month(reference_month, -1)
+    _, previous_income, previous_expenses = monthly_totals(all_transactions, previous_month)
+    net = income - expenses
+    savings_rate = (net / income * Decimal("100")).quantize(Decimal("0.1")) if income else None
+    expense_change = percentage_change(expenses, previous_expenses)
+
+    category_totals = {}
+    for item in (row for row in base if row.kind == "expense"):
+        ratio = personal_value(item) / money(item.amount) if money(item.amount) else Decimal("0")
+        allocations = [(split.category, money(split.amount) * ratio) for split in item.splits] or [(item.category, personal_value(item))]
+        for category, amount in allocations:
+            name = category.full_name if category else "Sem categoria"
+            color = category.color if category else "#8E8D8A"
+            category_totals.setdefault(name, {"amount": Decimal("0"), "color": color})
+            category_totals[name]["amount"] += amount
+    categories = sorted(
+        ({"name": name, **values} for name, values in category_totals.items()),
+        key=lambda row: row["amount"], reverse=True,
+    )[:6]
+
+    trend = []
+    for offset in range(-5, 1):
+        month = shift_month(reference_month, offset)
+        _, month_income, month_expenses = monthly_totals(all_transactions, month)
+        trend.append({
+            "label": month_label(month, short=True),
+            "income": float(month_income),
+            "expenses": float(month_expenses),
+        })
+
+    guidance = []
+    if previous_expenses and expense_change is not None:
+        if expense_change > 10:
+            guidance.append({"tone": "danger", "title": "Gastos aceleraram", "text": f"Você gastou {expense_change}% a mais que em {month_label(previous_month)}."})
+        elif expense_change < -10:
+            guidance.append({"tone": "success", "title": "Gastos recuaram", "text": f"Você gastou {abs(expense_change)}% a menos que no mês anterior."})
+        else:
+            guidance.append({"tone": "info", "title": "Gastos estáveis", "text": "As despesas ficaram próximas do mês anterior."})
+    if categories and expenses:
+        share = (categories[0]["amount"] / expenses * Decimal("100")).quantize(Decimal("1"))
+        guidance.append({"tone": "warning", "title": "Maior peso do mês", "text": f"{categories[0]['name']} concentrou {share}% das despesas."})
+    if income:
+        guidance.append({
+            "tone": "success" if net >= 0 else "danger",
+            "title": "Resultado positivo" if net >= 0 else "Mês no negativo",
+            "text": f"Sobraram {brl(net)} após as despesas." if net >= 0 else f"As despesas superaram as entradas em {brl(abs(net))}.",
+        })
+    if not guidance:
+        guidance.append({"tone": "info", "title": "Construa seu histórico", "text": "Registre entradas e despesas para liberar comparações mensais."})
     cash = cash_balance()
     card_commitment = outstanding_card_commitment()
     balance = cash - card_commitment
     next_invoice = Invoice.query.filter_by(status="confirmed").order_by(Invoice.reference_month.desc()).first()
     transactions = Transaction.query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).limit(5).all()
+    chart_data = {
+        "trend": trend,
+        "categories": {
+            "labels": [row["name"] for row in categories],
+            "values": [float(row["amount"]) for row in categories],
+            "colors": [row["color"] for row in categories],
+        },
+    }
     return render_template(
         "dashboard.html", balance=balance, cash=cash, card_commitment=card_commitment,
-        income=income, expenses=expenses, reference_month=reference_month,
+        income=income, expenses=expenses, net=net, savings_rate=savings_rate,
+        expense_change=expense_change, previous_income=previous_income,
+        previous_expenses=previous_expenses, previous_month_name=month_label(previous_month),
+        categories=categories, guidance=guidance, chart_data=chart_data,
+        reference_month=reference_month,
         month_name=month_label(reference_month), next_invoice=next_invoice,
         transactions=transactions, today=today,
     )
@@ -750,7 +822,7 @@ def transactions():
                 kind=request.form["kind"], transaction_date=transaction_date,
                 account_id=request.form.get("account_id") or None, category_id=category_id,
                 card_id=card.id if card else None, notes=request.form.get("notes", "").strip(),
-                competence_month=card_competence_month(card, transaction_date) if card else transaction_date.strftime("%Y-%m"),
+                competence_month=transaction_date.strftime("%Y-%m"),
                 payment_responsibility=responsibility, personal_amount=personal_amount,
             )
             if not transaction.description or transaction.amount <= 0:
@@ -786,7 +858,7 @@ def edit_transaction(item_id):
             item.account_id = request.form.get("account_id") or None
             card = db.session.get(CreditCard, int(request.form["card_id"])) if request.form.get("card_id") else None
             item.card_id = card.id if card else None
-            item.competence_month = card_competence_month(card, item.transaction_date) if card else item.transaction_date.strftime("%Y-%m")
+            item.competence_month = item.transaction_date.strftime("%Y-%m")
             item.payment_responsibility, item.personal_amount = responsibility_values(
                 item.amount,
                 request.form.get("payment_responsibility", "self"),
@@ -1181,6 +1253,10 @@ def review_invoice(invoice_id):
     categories = category_options("expense")
     suggestion = invoice_review_suggestion(invoice)
     if request.method == "POST":
+        expense_month = invoice_expense_month(invoice.reference_month)
+        if month_is_closed(expense_month):
+            flash(f"A competência {expense_month} está fechada. Reabra o mês antes de confirmar a fatura.", "warning")
+            return render_template("review_invoice.html", invoice=invoice, categories=categories, suggestion=suggestion)
         selected_ids = {int(value) for value in request.form.getlist("selected")}
         closing_date = datetime.strptime(request.form["closing_date"], "%Y-%m-%d").date()
         due_date = datetime.strptime(request.form["due_date"], "%Y-%m-%d").date()
@@ -1210,7 +1286,7 @@ def review_invoice(invoice_id):
             item.personal_amount = personal_amount
             if item.selected:
                 total += item.amount
-                db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id, source="invoice", installment_current=item.installment_current, installment_total=item.installment_total, competence_month=invoice.reference_month, payment_responsibility=responsibility, personal_amount=personal_amount))
+                db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id, source="invoice", installment_current=item.installment_current, installment_total=item.installment_total, competence_month=expense_month, payment_responsibility=responsibility, personal_amount=personal_amount))
         source = "pdf" if request.form.get("date_source") == "pdf" else "manual"
         upsert_card_cycle(invoice.card, invoice.reference_month, closing_date, due_date, source)
         invoice.statement_total = official_total
@@ -1241,7 +1317,8 @@ def discard_invoice(invoice_id):
 @login_required
 def delete_invoice_data(invoice_id):
     invoice = db.get_or_404(Invoice, invoice_id)
-    if MonthlyClose.query.filter_by(reference_month=invoice.reference_month).first():
+    expense_month = invoice_expense_month(invoice.reference_month)
+    if MonthlyClose.query.filter(MonthlyClose.reference_month.in_([invoice.reference_month, expense_month])).first():
         flash("A competência desta fatura está fechada. Reabra o mês antes de excluir os dados.", "warning")
         return redirect(url_for("main.invoices"))
 
@@ -1304,10 +1381,26 @@ def financial_calendar():
     materialize_recurring(reference_month)
     events = []
     for row in Transaction.query.filter(Transaction.transaction_date.between(start, end)).all():
-        events.append({"date":row.transaction_date,"title":row.description,"amount":row.amount,"tone":"income" if row.kind == "income" else "expense","detail":"Previsto" if row.status == "planned" else "Realizado"})
+        events.append({"date":row.transaction_date,"title":row.description,"amount":personal_value(row),"tone":"income" if row.kind == "income" else "expense","detail":"Previsto" if row.status == "planned" else "Realizado"})
     for cycle in CardCycle.query.filter(CardCycle.due_date.between(start, end)).all():
-        events.append({"date":cycle.due_date,"title":f"Fatura {cycle.card.name}","amount":None,"tone":"card","detail":"Vencimento"})
-    return render_template("calendar.html", reference_month=reference_month, month_name=month_label(reference_month), events=sorted(events, key=lambda row: row["date"]))
+        invoice = Invoice.query.filter_by(card_id=cycle.card_id, reference_month=cycle.reference_month, status="confirmed").first()
+        events.append({"date":cycle.due_date,"title":f"Fatura {cycle.card.name}","amount":money(invoice.total) if invoice else None,"tone":"card","detail":"Vencimento da fatura"})
+    events = sorted(events, key=lambda row: (row["date"], row["tone"], row["title"]))
+    events_by_day = {}
+    for event in events:
+        events_by_day.setdefault(event["date"].day, []).append(event)
+    weeks = []
+    for week in calendar.Calendar(firstweekday=0).monthdayscalendar(start.year, start.month):
+        weeks.append([{"day": day, "events": events_by_day.get(day, [])} if day else None for day in week])
+    realized_income = sum((money(event["amount"]) for event in events if event["tone"] == "income" and event["detail"] == "Realizado"), Decimal("0"))
+    realized_expenses = sum((money(event["amount"]) for event in events if event["tone"] == "expense" and event["detail"] == "Realizado"), Decimal("0"))
+    planned = sum((money(event["amount"]) for event in events if event["detail"] == "Previsto"), Decimal("0"))
+    return render_template(
+        "calendar.html", reference_month=reference_month, month_name=month_label(reference_month),
+        events=events, weeks=weeks, today=date.today(), realized_income=realized_income,
+        realized_expenses=realized_expenses, planned=planned,
+        previous_month=shift_month(reference_month, -1), next_month=shift_month(reference_month, 1),
+    )
 
 
 @main.route("/metas", methods=["GET", "POST"])
