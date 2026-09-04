@@ -399,6 +399,7 @@ def test_itau_adapter_reads_side_by_side_rows_and_reconciles_totals():
     assert all("Pagamento" not in item["description"] for item in items)
     assert all("10/10" not in item["description"] for item in items)
 
+
 def test_itau_adapter_keeps_old_purchases_installments_and_wrapped_rows():
     details = """
     LANÇAMENTOS DO CARTÃO
@@ -806,7 +807,8 @@ def test_edit_invoice_total_preserves_items_and_rejects_value_below_payments(cli
     with app.app_context():
         invoice = db.session.get(Invoice, invoice_id)
         assert invoice.total == Decimal("120.50")
-        assert invoice.statement_total == Decimal("120.50")        assert len(invoice.items) == 1
+        assert invoice.statement_total == Decimal("120.50")
+        assert len(invoice.items) == 1
 
     response = client.post(f"/faturas/{invoice_id}/total", data={"total": "50,00"}, follow_redirects=True)
     assert "igual ou maior que o valor já pago" in response.text
