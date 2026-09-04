@@ -247,8 +247,7 @@ def parse_itau_summary(first_page_text, third_page_text, reference_month):
         "statement_total": calculated_total or cover_total,
         "cover_total": cover_total,
         "components": components,
-        "credit_limit": _find_labeled_amount(
-            first_page_text,
+        "credit_limit": _find_labeled_amount(            first_page_text,
             r"limite\s+total\s+de\s+cr[eé]dito",
         ),
         "cash_advance_total": None,
@@ -497,8 +496,7 @@ def parse_banco_inter_text(text, reference_month):
     return items
 
 
-def parse_itau_text(text, reference_month):
-    section_match = ITAU_SECTION_PATTERN.search(text)
+def parse_itau_text(text, reference_month):    section_match = ITAU_SECTION_PATTERN.search(text)
     if not section_match:
         return []
 
@@ -743,9 +741,24 @@ def _bb_compact_table_image(image):
 
 
 def _normalize_bb_ocr_text(recognized):
-    """Corrige confusões previsíveis do Tesseract no quadro monetário."""
-    recognized = re.sub(r"\bR[SG§g]\s*(?=\d)", "R$ ", recognized, flags=re.IGNORECASE)
-    return re.sub(r"(?<=\d)\.(?=\d{2}(?:\D|$))", ",", recognized)
+    """Corrige confusões previsíveis do Tesseract nas linhas do BB."""
+    # Limita a correção ao campo de data no início da linha. Assim, nomes de
+    # estabelecimentos e números de parcelas permanecem exatamente como o OCR
+    # os reconheceu. No PDF real, 18/08 foi lido como 1g/o8.
+    def normalize_date(match):
+        raw_date = match.group("date")
+        normalized_date = raw_date.translate(str.maketrans({
+            "g": "8", "G": "8", "o": "0", "O": "0",
+        }))
+        return f"{match.group('prefix')}{normalized_date}"
+
+    recognized = re.sub(
+        r"(?m)^(?P<prefix>\\s*)(?P<date>[0-9gGoO]{2}/[0-9gGoO]{2})(?=\\s|$)",
+        normalize_date,
+        recognized,
+    )
+    recognized = re.sub(r"\\bR[SG§g]\\s*(?=\\d)", "R$ ", recognized, flags=re.IGNORECASE)
+    return re.sub(r"(?<=\\d)\\.(?=\\d{2}(?:\\D|$))", ",", recognized)
 
 
 def ocr_pdf_pages(reader):
