@@ -247,7 +247,8 @@ def parse_itau_summary(first_page_text, third_page_text, reference_month):
         "statement_total": calculated_total or cover_total,
         "cover_total": cover_total,
         "components": components,
-        "credit_limit": _find_labeled_amount(            first_page_text,
+        "credit_limit": _find_labeled_amount(
+            first_page_text,
             r"limite\s+total\s+de\s+cr[eé]dito",
         ),
         "cash_advance_total": None,
@@ -496,7 +497,8 @@ def parse_banco_inter_text(text, reference_month):
     return items
 
 
-def parse_itau_text(text, reference_month):    section_match = ITAU_SECTION_PATTERN.search(text)
+def parse_itau_text(text, reference_month):
+    section_match = ITAU_SECTION_PATTERN.search(text)
     if not section_match:
         return []
 
