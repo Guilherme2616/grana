@@ -446,7 +446,26 @@ def invoice_expense_month(reference_month):
 
 
 def monthly_totals(rows, reference_month):
-    selected = [item for item in rows if transaction_reference_month(item) == reference_month]
+    # No painel inicial, cartão é fluxo de caixa: uma fatura de setembro sai
+    # em setembro, embora suas compras pertençam à competência econômica de
+    # agosto. Movimentações sem fatura continuam usando sua competência/data.
+    invoice_item_ids = {
+        item.id
+        for invoice in Invoice.query.filter_by(
+            status="confirmed",
+            reference_month=reference_month,
+        ).all()
+        for item in invoice.items
+        if item.selected
+    }
+    selected = [
+        item for item in rows
+        if (
+            item.invoice_item_id in invoice_item_ids
+            if item.invoice_item_id is not None
+            else transaction_reference_month(item) == reference_month
+        )
+    ]
     income = sum((money(item.amount) for item in selected if item.kind == "income"), Decimal("0"))
     expenses = sum((personal_value(item) for item in selected if item.kind == "expense"), Decimal("0"))
     refunds = sum((personal_value(item) for item in selected if item.kind == "refund"), Decimal("0"))
@@ -575,10 +594,18 @@ def dashboard():
         month_bounds(reference_month)
     except (ValueError, IndexError):
         reference_month = today.strftime("%Y-%m")
-    if not request.args.get("month") and all_transactions:
-        current_rows = [item for item in all_transactions if transaction_reference_month(item) == reference_month]
-        if not current_rows:
-            reference_month = max(transaction_reference_month(item) for item in all_transactions)
+    if not request.args.get("month"):
+        available_months = {
+            transaction_reference_month(item)
+            for item in all_transactions
+            if item.invoice_item_id is None
+        }
+        available_months.update(
+            invoice.reference_month
+            for invoice in Invoice.query.filter_by(status="confirmed").all()
+        )
+        if reference_month not in available_months and available_months:
+            reference_month = max(available_months)
     base, income, expenses = monthly_totals(all_transactions, reference_month)
     previous_month = shift_month(reference_month, -1)
     _, previous_income, previous_expenses = monthly_totals(all_transactions, previous_month)
