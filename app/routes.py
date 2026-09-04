@@ -412,18 +412,18 @@ def cash_balance():
 
 
 def outstanding_card_commitment():
-    """Valor pessoal ainda comprometido nos cartões, sem duplicar a baixa."""
+    """Valor integral ainda comprometido nos cartões, sem duplicar a baixa."""
     total = Decimal("0")
     for invoice in Invoice.query.filter_by(status="confirmed").all():
-        personal_total = sum((
-            money(item.amount if item.personal_amount is None else item.personal_amount)
+        invoice_total = sum((
+            money(item.amount)
             for item in invoice.items if item.selected
         ), Decimal("0"))
-        self_paid = sum((
+        paid_total = sum((
             money(payment.amount) for payment in invoice.payments
-            if payment.paid_by == "self" and payment.payment_date <= date.today()
+            if payment.payment_date <= date.today()
         ), Decimal("0"))
-        total += max(personal_total - self_paid, Decimal("0"))
+        total += max(invoice_total - paid_total, Decimal("0"))
 
     manual_card_rows = Transaction.query.filter(
         Transaction.card_id.isnot(None),
@@ -431,8 +431,8 @@ def outstanding_card_commitment():
         Transaction.status == "confirmed",
         Transaction.transaction_date <= date.today(),
     ).all()
-    total += sum((personal_value(item) for item in manual_card_rows if item.kind == "expense"), Decimal("0"))
-    total -= sum((personal_value(item) for item in manual_card_rows if item.kind == "refund"), Decimal("0"))
+    total += sum((money(item.amount) for item in manual_card_rows if item.kind == "expense"), Decimal("0"))
+    total -= sum((money(item.amount) for item in manual_card_rows if item.kind == "refund"), Decimal("0"))
     return max(total, Decimal("0"))
 
 
@@ -467,8 +467,8 @@ def monthly_totals(rows, reference_month):
         )
     ]
     income = sum((money(item.amount) for item in selected if item.kind == "income"), Decimal("0"))
-    expenses = sum((personal_value(item) for item in selected if item.kind == "expense"), Decimal("0"))
-    refunds = sum((personal_value(item) for item in selected if item.kind == "refund"), Decimal("0"))
+    expenses = sum((money(item.amount) for item in selected if item.kind == "expense"), Decimal("0"))
+    refunds = sum((money(item.amount) for item in selected if item.kind == "refund"), Decimal("0"))
     return selected, income, expenses - refunds
 
 
@@ -615,8 +615,7 @@ def dashboard():
 
     category_totals = {}
     for item in (row for row in base if row.kind == "expense"):
-        ratio = personal_value(item) / money(item.amount) if money(item.amount) else Decimal("0")
-        allocations = [(split.category, money(split.amount) * ratio) for split in item.splits] or [(item.category, personal_value(item))]
+        allocations = [(split.category, money(split.amount)) for split in item.splits] or [(item.category, money(item.amount))]
         for category, amount in allocations:
             name = category.full_name if category else "Sem categoria"
             color = category.color if category else "#8E8D8A"
