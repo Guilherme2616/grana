@@ -10,6 +10,7 @@ from app.models import Account, AssetPrice, CardCycle, Category, CategoryRule, C
 from app.services.drive_sync import month_folder_matches, normalize_folder_name
 from app.services.financial_analytics import build_installment_projection, month_label, shift_month
 from app.services.invoice_parser import (
+    _normalize_bb_ocr_text,
     detect_bb_statement_total,
     detect_due_date,
     is_banco_inter_invoice,
@@ -398,7 +399,6 @@ def test_itau_adapter_reads_side_by_side_rows_and_reconciles_totals():
     assert all("Pagamento" not in item["description"] for item in items)
     assert all("10/10" not in item["description"] for item in items)
 
-
 def test_itau_adapter_keeps_old_purchases_installments_and_wrapped_rows():
     details = """
     LANÇAMENTOS DO CARTÃO
@@ -611,6 +611,15 @@ def test_bb_scanned_pdf_uses_ocr_fallback(monkeypatch):
     assert sum(item["amount"] for item in parsed["items"]) == Decimal("294.31")
 
 
+def test_bb_ocr_normalizes_confused_date_without_changing_description():
+    recognized = "1g/o8 | EC *PARC 01/02 BARUERI BR R$ 30,80\n"
+    normalized = _normalize_bb_ocr_text(recognized)
+    assert normalized == "18/08 | EC *PARC 01/02 BARUERI BR R$ 30,80\n"
+    items = parse_bb_smiles_text(normalized, "2026-09")
+    assert len(items) == 1
+    assert items[0]["amount"] == Decimal("30.80")
+
+
 def test_itau_pdf_reads_current_purchases_beyond_third_page(monkeypatch):
     pages = [
         """Itaú Personnalité\nO total da sua fatura é: R$ 60,00\nVencimento 10/08/2026\nLimite total de crédito R$ 15.000,00""",
@@ -797,8 +806,7 @@ def test_edit_invoice_total_preserves_items_and_rejects_value_below_payments(cli
     with app.app_context():
         invoice = db.session.get(Invoice, invoice_id)
         assert invoice.total == Decimal("120.50")
-        assert invoice.statement_total == Decimal("120.50")
-        assert len(invoice.items) == 1
+        assert invoice.statement_total == Decimal("120.50")        assert len(invoice.items) == 1
 
     response = client.post(f"/faturas/{invoice_id}/total", data={"total": "50,00"}, follow_redirects=True)
     assert "igual ou maior que o valor já pago" in response.text
