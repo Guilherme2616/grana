@@ -946,6 +946,38 @@ def test_dashboard_uses_latest_month_and_deducts_unpaid_card_commitment(client, 
     assert "R$ 400,00" in response.text
 
 
+def test_dashboard_counts_invoice_in_payment_month_without_duplicating_competence(client, app):
+    login(client)
+    with app.app_context():
+        card = CreditCard.query.first()
+        category = Category.query.first()
+        invoice = Invoice(
+            card_id=card.id, reference_month="2026-09",
+            total=Decimal("80.00"), status="confirmed",
+        )
+        db.session.add(invoice); db.session.flush()
+        item = InvoiceItem(
+            invoice_id=invoice.id, purchase_date=date(2026, 8, 15),
+            description="COMPRA DE AGOSTO", amount=Decimal("80.00"),
+            selected=True, category_id=category.id,
+            payment_responsibility="self", personal_amount=Decimal("80.00"),
+        )
+        db.session.add(item); db.session.flush()
+        db.session.add(Transaction(
+            description=item.description, amount=item.amount, kind="expense",
+            transaction_date=item.purchase_date, card_id=card.id,
+            category_id=category.id, invoice_item_id=item.id,
+            competence_month="2026-08", source="invoice",
+            payment_responsibility="self", personal_amount=Decimal("80.00"),
+        ))
+        db.session.commit()
+
+    september = client.get("/?month=2026-09")
+    august = client.get("/?month=2026-08")
+    assert "Saídas · Setembro/2026</span><strong>R$ 80,00" in september.text
+    assert "Saídas · Agosto/2026</span><strong>R$ 0,00" in august.text
+
+
 def test_future_invoices_compares_cashflow_and_lists_other_expenses(client, app):
     login(client)
     with app.app_context():
