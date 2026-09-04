@@ -1491,8 +1491,9 @@ def budget_planning():
 @login_required
 def monthly_closing():
     reference_month = request.values.get("month") or date.today().strftime("%Y-%m")
-    start, end = month_bounds(reference_month); rows = Transaction.query.filter(Transaction.transaction_date.between(start,end), Transaction.status == "confirmed").all()
-    income = sum((Decimal(row.amount) for row in rows if row.kind == "income"), Decimal("0")); expenses = sum((Decimal(row.amount) for row in rows if row.kind == "expense"), Decimal("0"))
+    month_bounds(reference_month)
+    confirmed_rows = Transaction.query.filter(Transaction.status == "confirmed").all()
+    rows, income, expenses = monthly_totals(confirmed_rows, reference_month)
     closed = MonthlyClose.query.filter_by(reference_month=reference_month).first()
     if request.method == "POST" and request.form.get("action") == "close" and not closed:
         snapshot = {"transactions":len(rows),"top":[row.description for row in sorted(rows,key=lambda x:x.amount,reverse=True)[:5]]}
@@ -1528,9 +1529,10 @@ def build_simple_pdf(lines):
 @main.get("/dados/relatorio.pdf")
 @login_required
 def monthly_pdf_report():
-    reference_month=request.args.get("month") or date.today().strftime("%Y-%m"); start,end=month_bounds(reference_month)
-    rows=Transaction.query.filter(Transaction.transaction_date.between(start,end)).order_by(Transaction.transaction_date).all()
-    income=sum((Decimal(x.amount) for x in rows if x.kind=="income"),Decimal("0")); expenses=sum((Decimal(x.amount) for x in rows if x.kind=="expense"),Decimal("0"))
+    reference_month=request.args.get("month") or date.today().strftime("%Y-%m"); month_bounds(reference_month)
+    confirmed_rows=Transaction.query.filter(Transaction.status == "confirmed").all()
+    rows,income,expenses=monthly_totals(confirmed_rows,reference_month)
+    rows=sorted(rows,key=lambda x:(x.transaction_date,x.id))
     lines=["GRANA - RELATORIO MENSAL",month_label(reference_month),"",f"Entradas: {brl(income)}",f"Despesas: {brl(expenses)}",f"Resultado: {brl(income-expenses)}","","MOVIMENTACOES"]
     lines.extend(f"{x.transaction_date:%d/%m} | {x.description[:48]} | {brl(x.amount)}" for x in rows[:42])
     return send_file(BytesIO(build_simple_pdf(lines)),mimetype="application/pdf",as_attachment=True,download_name=f"grana-relatorio-{reference_month}.pdf")
