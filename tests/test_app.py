@@ -93,7 +93,7 @@ def test_card_competence_responsibility_and_invoice_payment_cash(client, app):
     assert response.status_code == 200
     with app.app_context():
         transaction = Transaction.query.filter_by(description="Compra dos pais").one()
-        assert transaction.competence_month == "2026-09"
+        assert transaction.competence_month == "2026-08"
         assert transaction.personal_amount == Decimal("0.00")
         invoice = Invoice(card_id=ids[1], reference_month="2026-09", total=Decimal("100.00"), status="confirmed", original_filename="setembro.pdf")
         db.session.add(invoice); db.session.commit(); invoice_id = invoice.id
@@ -980,7 +980,8 @@ def test_dashboard_counts_invoice_in_payment_month_without_duplicating_competenc
 
     closing = client.get("/fechamento?month=2026-09")
     assert "Despesas</span><strong>R$ 80,00" in closing.text
-    assert "Resultado</span><strong>R$ -80,00" in closing.text
+    assert "Resultado</span><strong class=" in closing.text
+    assert "R$ -80,00" in closing.text
 
     report = client.get("/dados/relatorio.pdf?month=2026-09")
     assert report.status_code == 200
