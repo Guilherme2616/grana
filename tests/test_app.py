@@ -978,6 +978,14 @@ def test_dashboard_counts_invoice_in_payment_month_without_duplicating_competenc
     assert "Comprometido nos cartões: R$ 80,00" in september.text
     assert "Saídas · Agosto/2026</span><strong>R$ 0,00" in august.text
 
+    closing = client.get("/fechamento?month=2026-09")
+    assert "Despesas</span><strong>R$ 80,00" in closing.text
+    assert "Resultado</span><strong>R$ -80,00" in closing.text
+
+    report = client.get("/dados/relatorio.pdf?month=2026-09")
+    assert report.status_code == 200
+    assert b"Despesas: R$ 80,00" in report.data
+
 
 def test_future_invoices_compares_cashflow_and_lists_other_expenses(client, app):
     login(client)
