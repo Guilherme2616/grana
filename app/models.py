@@ -197,10 +197,53 @@ class Investment(db.Model):
         return (self.quantity or Decimal("0")) * (self.unit_value or Decimal("0"))
 
 
+class DividendImport(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    original_filename = db.Column(db.String(255), nullable=False)
+    drive_file_id = db.Column(db.String(255), unique=True, nullable=True)
+    period_start = db.Column(db.Date, nullable=True)
+    period_end = db.Column(db.Date, nullable=True)
+    status = db.Column(db.String(20), default="draft", nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    confirmed_at = db.Column(db.DateTime, nullable=True)
+
+
+class DividendIncome(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    import_id = db.Column(db.Integer, db.ForeignKey("dividend_import.id"), nullable=False)
+    income_type = db.Column(db.String(50), nullable=False)
+    asset = db.Column(db.String(30), nullable=False)
+    asset_name = db.Column(db.String(180), default="", nullable=False)
+    institution = db.Column(db.String(140), default="", nullable=False)
+    quantity = db.Column(db.Numeric(18, 8), nullable=False)
+    unit_value = db.Column(db.Numeric(18, 8), nullable=False)
+    amount = db.Column(db.Numeric(14, 2), nullable=False)
+    payment_date = db.Column(db.Date, nullable=False)
+    selected = db.Column(db.Boolean, default=True, nullable=False)
+    fingerprint = db.Column(db.String(64), unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    source_import = db.relationship(
+        "DividendImport",
+        backref=db.backref("items", cascade="all, delete-orphan", lazy=True),
+    )
+
+
 class AssetPrice(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     asset = db.Column(db.String(30), unique=True, nullable=False)
     current_price = db.Column(db.Numeric(14, 2), nullable=False)
+    asset_name = db.Column(db.String(120), default="", nullable=False)
+    change_percent = db.Column(db.Numeric(10, 4), nullable=True)
+    source = db.Column(db.String(30), default="manual", nullable=False)
+    last_attempt_at = db.Column(db.DateTime, nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class IntegrationSetting(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(60), unique=True, nullable=False)
+    encrypted_value = db.Column(db.Text, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 

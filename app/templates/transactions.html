@@ -10,7 +10,7 @@
   <label>Tipo<select name="kind"><option value="">Todos</option><option value="expense" {{ 'selected' if filters.kind=='expense' }}>Saída</option><option value="income" {{ 'selected' if filters.kind=='income' }}>Entrada</option></select></label>
   <div class="filter-actions"><button class="primary-button">Filtrar</button><a class="secondary-button" href="{{ url_for('main.transactions') }}">Limpar</a></div>
 </form></details>
-<section class="panel form-panel"><h2>Novo lançamento</h2><form method="post" class="form-grid" id="transaction-form">
+<details class="panel advanced-filters new-transaction-panel" id="new-transaction" {{ 'open' if request.method == 'POST' }}><summary><span><b>＋</b> Novo lançamento</span><small>Clique para preencher</small></summary><form method="post" class="form-grid" id="transaction-form">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label class="span-2">Descrição<input name="description" required></label><label>Valor<input name="amount" required></label>
   <label>Tipo<select name="kind"><option value="expense">Saída</option><option value="income">Entrada</option></select></label>
@@ -21,7 +21,7 @@
   <label>Quem paga?<select name="payment_responsibility" id="payment-responsibility"><option value="self">Eu</option><option value="parents">Meus pais</option><option value="shared">Dividido</option></select></label>
   <label id="personal-amount-field" hidden>Minha parte<input name="personal_amount" placeholder="0,00"></label>
   <label class="span-2">Observações<textarea name="notes"></textarea></label><div class="form-actions span-2"><button class="primary-button">Salvar</button></div>
-</form></section>
+</form></details>
 <section class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>Data</th><th>Competência</th><th>Descrição</th><th>Categoria</th><th>Origem</th><th>Responsável</th><th>Valor</th><th></th></tr></thead><tbody>
 {% for item in transactions %}<tr><td>{{ item.transaction_date.strftime('%d/%m/%Y') }}</td><td>{{ item.competence_month or item.transaction_date.strftime('%Y-%m') }}</td><td><strong>{{ item.description }}</strong><small class="table-subtitle">{{ item.source }}{% if item.status=='planned' %} · previsto{% endif %}</small></td><td>{{ item.category.full_name if item.category else ('Dividido' if item.splits else '—') }}</td><td>{{ item.card.name if item.card else item.account.name if item.account else '—' }}</td><td>{{ 'Meus pais' if item.payment_responsibility == 'parents' else 'Dividido' if item.payment_responsibility == 'shared' else 'Eu' }}{% if item.payment_responsibility == 'shared' %}<small class="table-subtitle">Minha parte: {{ (item.personal_amount if item.personal_amount is not none else item.amount)|brl }}</small>{% endif %}</td><td class="money {{ item.kind }}-value">{{ '+' if item.kind=='income' else '-' }} {{ item.amount|brl }}</td><td><div class="row-actions"><a href="{{ url_for('main.edit_transaction',item_id=item.id) }}">Editar</a><a href="{{ url_for('main.split_transaction',item_id=item.id) }}">Dividir</a><form method="post" action="{{ url_for('main.delete_transaction',item_id=item.id) }}" onsubmit="return confirm('Excluir?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="danger-link">Excluir</button></form></div></td></tr>
 {% else %}<tr><td colspan="8" class="empty">Nenhum lançamento.</td></tr>{% endfor %}

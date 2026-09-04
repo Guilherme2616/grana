@@ -15,7 +15,13 @@
     {% if invoice.status == 'draft' %}
       <a href="{{ url_for('main.review_invoice',invoice_id=invoice.id) }}">Continuar revisão</a>
       <form method="post" action="{{ url_for('main.reprocess_invoice',invoice_id=invoice.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="text-button">Reprocessar</button></form>
-    {% elif row.outstanding > 0 %}
+    {% else %}
+      <details><summary>Editar total</summary><form method="post" action="{{ url_for('main.update_invoice_total',invoice_id=invoice.id) }}" class="form-stack">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="status" value="{{ current_status }}">
+        <label>Novo total<input name="total" inputmode="decimal" value="{{ '%.2f'|format(invoice.total)|replace('.', ',') }}" required></label>
+        <small>As compras e pagamentos não serão alterados.</small><button class="primary-button">Salvar total</button>
+      </form></details>
+    {% if row.outstanding > 0 %}
       <details><summary>Registrar pagamento</summary><form method="post" action="{{ url_for('main.add_invoice_payment',invoice_id=invoice.id) }}" class="form-stack">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <label>Valor<input name="amount" value="{{ '%.2f'|format(row.outstanding)|replace('.', ',') }}" required></label>
@@ -24,6 +30,7 @@
         <label>Conta<select name="account_id"><option value="">Selecione</option>{% for account in accounts %}<option value="{{ account.id }}">{{ account.name }}</option>{% endfor %}</select></label>
         <button class="primary-button">Dar baixa</button>
       </form></details>
+    {% endif %}
     {% endif %}
     <form method="post" action="{{ url_for('main.delete_invoice_data',invoice_id=invoice.id) }}" onsubmit="return confirm('Excluir esta fatura, as compras importadas e os pagamentos vinculados? Esta ação não pode ser desfeita.')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="text-button danger">Excluir dados</button></form>
   </div></td>

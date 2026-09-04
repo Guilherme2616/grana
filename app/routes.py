@@ -1,7 +1,8 @@
 import calendar
 import csv
 import json
-from datetime import date, datetime
+import unicodedata
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 
@@ -10,14 +11,16 @@ from flask_login import current_user, login_required, login_user, logout_user
 from sqlalchemy import extract, func
 
 from .extensions import db
-from .models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
+from .models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, DividendImport, DividendIncome, FinancialGoal, IntegrationSetting, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
 from .services.drive_sync import (
     DriveAccessError,
     DriveConfigurationError,
     download_pdf,
     drive_is_configured,
+    list_dividend_pdfs,
     list_month_pdfs,
 )
+from .services.dividend_parser import DividendStatementError, parse_b3_dividend_pdf
 from .services.financial_analytics import (
     build_installment_projection,
     month_bounds,
@@ -25,6 +28,7 @@ from .services.financial_analytics import (
     shift_month,
 )
 from .services.invoice_parser import PdfPasswordInvalid, PdfPasswordRequired, parse_invoice_pdf
+from .services.market_data import MarketDataError, fetch_brapi_quote
 from .services.secret_store import decrypt_secret, encrypt_secret
 
 
@@ -42,6 +46,39 @@ PROVIDER_LABELS = dict(INVOICE_PROVIDERS)
 
 def money(value):
     return Decimal(str(value or 0)).quantize(Decimal("0.01"))
+
+
+def invoice_provider_hint(card):
+    if card.invoice_provider:
+        return card.invoice_provider
+    identity = f"{card.name} {card.institution}".lower()
+    if any(marker in identity for marker in ("banco do brasil", "ourocard", "smiles")):
+        return "bb_smiles"
+    if "itaú" in identity or "itau" in identity:
+        return "itau"
+    if "mercado pago" in identity:
+        return "mercado_pago"
+    if "inter" in identity:
+        return "banco_inter"
+    return ""
+
+
+def invoice_filename_provider_hint(filename, cards):
+    normalized = unicodedata.normalize("NFKD", filename or "").encode("ascii", "ignore").decode().lower()
+    markers = (
+        ("bb_smiles", ("smiles", "ourocard", "banco do brasil")),
+        ("itau", ("itau",)),
+        ("mercado_pago", ("mercado pago",)),
+        ("banco_inter", ("banco inter", "inter")),
+    )
+    for provider, values in markers:
+        if any(value in normalized for value in values):
+            return provider
+    for card in cards:
+        card_name = unicodedata.normalize("NFKD", card.name or "").encode("ascii", "ignore").decode().lower().strip()
+        if card_name and card_name in normalized:
+            return invoice_provider_hint(card)
+    return ""
 
 
 def personal_value(item):
@@ -216,7 +253,7 @@ def replace_invoice_draft(invoice, parsed):
     invoice.date_source = "pdf" if parsed.get("due_date") else "default"
 
 
-def parse_with_saved_passwords(stream_factory, reference_month, cards):
+def parse_with_saved_passwords(stream_factory, reference_month, cards, expected_provider=""):
     passwords = [""]
     for card in cards:
         password = decrypt_secret(card.pdf_password_encrypted)
@@ -226,7 +263,7 @@ def parse_with_saved_passwords(stream_factory, reference_month, cards):
     password_error = None
     for password in passwords:
         try:
-            return parse_invoice_pdf(stream_factory(), reference_month, password)
+            return parse_invoice_pdf(stream_factory(), reference_month, password, expected_provider)
         except (PdfPasswordRequired, PdfPasswordInvalid) as exc:
             password_error = exc
     if password_error:
@@ -274,21 +311,165 @@ def filter_transactions(rows, filters):
     return result
 
 
+def integration_secret(key):
+    setting = IntegrationSetting.query.filter_by(key=key).first()
+    return decrypt_secret(setting.encrypted_value) if setting else ""
+
+
+def build_investment_positions(items, imported_receipts=None):
+    imported_receipts = imported_receipts or {}
+    positions = []
+    for asset in sorted({row.asset for row in items if row.operation in {"Compra", "Venda"}}):
+        asset_rows = [row for row in items if row.asset == asset]
+        buys = [row for row in asset_rows if row.operation == "Compra"]
+        sales = [row for row in asset_rows if row.operation == "Venda"]
+        quantity = sum((Decimal(row.quantity) for row in buys), Decimal("0")) - sum((Decimal(row.quantity) for row in sales), Decimal("0"))
+        if quantity <= 0:
+            continue
+        bought_quantity = sum((Decimal(row.quantity) for row in buys), Decimal("0"))
+        cost = sum((row.total_value + Decimal(row.fees or 0) for row in buys), Decimal("0"))
+        average = cost / bought_quantity if bought_quantity else Decimal("0")
+        quote = AssetPrice.query.filter_by(asset=asset).first()
+        current_price = Decimal(quote.current_price) if quote else average
+        current_value = quantity * current_price
+        invested_cost = quantity * average
+        pnl = current_value - invested_cost
+        receipts = sum((row.total_value for row in asset_rows if row.operation == "Recebimento"), Decimal("0"))
+        receipts += money(imported_receipts.get(asset))
+        positions.append({
+            "asset": asset,
+            "asset_name": quote.asset_name if quote else "",
+            "quantity": quantity,
+            "average": average,
+            "current_price": current_price,
+            "current_value": current_value,
+            "invested_cost": invested_cost,
+            "pnl": pnl,
+            "return_pct": (pnl / invested_cost * 100).quantize(Decimal("0.1")) if invested_cost else None,
+            "receipts": receipts,
+            "change_percent": Decimal(quote.change_percent) if quote and quote.change_percent is not None else None,
+            "quote_source": quote.source if quote else "cost",
+            "updated_at": quote.updated_at if quote else None,
+        })
+    return positions
+
+
+def refresh_asset_quotes(assets, force=False):
+    token = integration_secret("brapi_token")
+    if not token:
+        return {"updated": 0, "skipped": 0, "errors": [], "configured": False}
+
+    now = datetime.utcnow()
+    cutoff = now - timedelta(minutes=30)
+    result = {"updated": 0, "skipped": 0, "errors": [], "configured": True}
+    for asset in sorted(set(assets)):
+        quote = AssetPrice.query.filter_by(asset=asset).first()
+        last_check = quote.last_attempt_at if quote else None
+        if not force and last_check and last_check >= cutoff:
+            result["skipped"] += 1
+            continue
+        try:
+            market_quote = fetch_brapi_quote(asset, token)
+            if not quote:
+                quote = AssetPrice(asset=asset, current_price=market_quote["price"])
+            quote.current_price = market_quote["price"]
+            quote.asset_name = market_quote["name"]
+            quote.change_percent = market_quote["change_percent"]
+            quote.source = "brapi"
+            quote.last_attempt_at = now
+            db.session.add(quote)
+            db.session.commit()
+            result["updated"] += 1
+        except MarketDataError as exc:
+            db.session.rollback()
+            if quote:
+                quote.last_attempt_at = now
+                db.session.add(quote)
+                db.session.commit()
+            result["errors"].append(f"{asset}: {exc}")
+    return result
+
+
 def investment_position():
-    items = Investment.query.all()
-    buys = sum((item.total_value for item in items if item.operation == "Compra"), Decimal("0"))
-    sales = sum((item.total_value for item in items if item.operation == "Venda"), Decimal("0"))
-    return buys - sales
+    return sum((row["current_value"] for row in build_investment_positions(Investment.query.all())), Decimal("0"))
 
 
 def cash_balance():
     initial = money(db.session.query(func.sum(Account.initial_balance)).filter(Account.active.is_(True)).scalar())
-    account_rows = Transaction.query.filter(Transaction.card_id.is_(None)).all()
+    account_rows = Transaction.query.filter(
+        Transaction.card_id.is_(None),
+        Transaction.status == "confirmed",
+        Transaction.transaction_date <= date.today(),
+    ).all()
     income = sum((money(item.amount) for item in account_rows if item.kind == "income"), Decimal("0"))
     refunds = sum((money(item.amount) for item in account_rows if item.kind == "refund"), Decimal("0"))
     expenses = sum((money(item.amount) for item in account_rows if item.kind == "expense"), Decimal("0"))
-    invoice_payments = sum((money(item.amount) for item in InvoicePayment.query.filter_by(paid_by="self").all()), Decimal("0"))
+    invoice_payments = sum((money(item.amount) for item in InvoicePayment.query.filter(
+        InvoicePayment.paid_by == "self",
+        InvoicePayment.payment_date <= date.today(),
+    ).all()), Decimal("0"))
     return initial + income + refunds - expenses - invoice_payments
+
+
+def outstanding_card_commitment():
+    """Valor integral ainda comprometido nos cartões, sem duplicar a baixa."""
+    total = Decimal("0")
+    for invoice in Invoice.query.filter_by(status="confirmed").all():
+        invoice_total = sum((
+            money(item.amount)
+            for item in invoice.items if item.selected
+        ), Decimal("0"))
+        paid_total = sum((
+            money(payment.amount) for payment in invoice.payments
+            if payment.payment_date <= date.today()
+        ), Decimal("0"))
+        total += max(invoice_total - paid_total, Decimal("0"))
+
+    manual_card_rows = Transaction.query.filter(
+        Transaction.card_id.isnot(None),
+        Transaction.invoice_item_id.is_(None),
+        Transaction.status == "confirmed",
+        Transaction.transaction_date <= date.today(),
+    ).all()
+    total += sum((money(item.amount) for item in manual_card_rows if item.kind == "expense"), Decimal("0"))
+    total -= sum((money(item.amount) for item in manual_card_rows if item.kind == "refund"), Decimal("0"))
+    return max(total, Decimal("0"))
+
+
+def transaction_reference_month(item):
+    return item.competence_month or item.transaction_date.strftime("%Y-%m")
+
+
+def invoice_expense_month(reference_month):
+    """Competência econômica da fatura: mês anterior ao vencimento."""
+    return shift_month(reference_month, -1)
+
+
+def monthly_totals(rows, reference_month):
+    # No painel inicial, cartão é fluxo de caixa: uma fatura de setembro sai
+    # em setembro, embora suas compras pertençam à competência econômica de
+    # agosto. Movimentações sem fatura continuam usando sua competência/data.
+    invoice_item_ids = {
+        item.id
+        for invoice in Invoice.query.filter_by(
+            status="confirmed",
+            reference_month=reference_month,
+        ).all()
+        for item in invoice.items
+        if item.selected
+    }
+    selected = [
+        item for item in rows
+        if (
+            item.invoice_item_id in invoice_item_ids
+            if item.invoice_item_id is not None
+            else transaction_reference_month(item) == reference_month
+        )
+    ]
+    income = sum((money(item.amount) for item in selected if item.kind == "income"), Decimal("0"))
+    expenses = sum((money(item.amount) for item in selected if item.kind == "expense"), Decimal("0"))
+    refunds = sum((money(item.amount) for item in selected if item.kind == "refund"), Decimal("0"))
+    return selected, income, expenses - refunds
 
 
 def future_invoice_rows(base_month, months=12):
@@ -303,6 +484,16 @@ def future_invoice_rows(base_month, months=12):
     )
     projection = build_installment_projection(installment_items, base_month, months)
     cards = {card.id: card for card in CreditCard.query.filter_by(active=True).all()}
+    cashflow = {}
+    for item in Transaction.query.all():
+        reference = transaction_reference_month(item)
+        values = cashflow.setdefault(reference, {"income": Decimal("0"), "other_expenses": Decimal("0")})
+        if item.kind == "income":
+            values["income"] += money(item.amount)
+        elif item.card_id is None and item.kind == "expense":
+            values["other_expenses"] += personal_value(item)
+        elif item.card_id is None and item.kind == "refund":
+            values["other_expenses"] -= personal_value(item)
 
     known = {}
     known_invoices = Invoice.query.filter(
@@ -335,12 +526,32 @@ def future_invoice_rows(base_month, months=12):
             "amount": amount,
             "confirmed": (reference, card_id) in known,
         } for card_id, amount in sorted(per_card.items(), key=lambda pair: pair[1], reverse=True)]
+        card_total = sum(per_card.values(), Decimal("0"))
+        month_cashflow = cashflow.get(reference, {"income": Decimal("0"), "other_expenses": Decimal("0")})
+        income = month_cashflow["income"]
+        other_expenses = month_cashflow["other_expenses"]
+        expenses_total = card_total + other_expenses
+        spending_groups = list(card_values)
+        if other_expenses:
+            spending_groups.append({
+                "id": None,
+                "name": "Demais gastos",
+                "color": "#8E8D8A",
+                "amount": other_expenses,
+                "confirmed": True,
+            })
         rows.append({
             "reference_month": reference,
             "label": month_label(reference),
             "short_label": month_label(reference, short=True),
-            "total": sum(per_card.values(), Decimal("0")),
+            "total": expenses_total,
+            "card_total": card_total,
+            "income": income,
+            "other_expenses": other_expenses,
+            "expenses_total": expenses_total,
+            "net": income - expenses_total,
             "cards": card_values,
+            "spending_groups": spending_groups,
             "details": details,
         })
     return rows
@@ -377,14 +588,96 @@ def logout():
 @login_required
 def dashboard():
     today = date.today()
-    reference_month = today.strftime("%Y-%m")
-    base = [item for item in Transaction.query.all() if (item.competence_month or item.transaction_date.strftime("%Y-%m")) == reference_month]
-    income = sum((money(item.amount) for item in base if item.kind == "income"), Decimal("0"))
-    expenses = sum((personal_value(item) for item in base if item.kind == "expense"), Decimal("0")) - sum((personal_value(item) for item in base if item.kind == "refund"), Decimal("0"))
-    balance = cash_balance()
+    all_transactions = Transaction.query.all()
+    reference_month = request.args.get("month") or today.strftime("%Y-%m")
+    try:
+        month_bounds(reference_month)
+    except (ValueError, IndexError):
+        reference_month = today.strftime("%Y-%m")
+    if not request.args.get("month"):
+        available_months = {
+            transaction_reference_month(item)
+            for item in all_transactions
+            if item.invoice_item_id is None
+        }
+        available_months.update(
+            invoice.reference_month
+            for invoice in Invoice.query.filter_by(status="confirmed").all()
+        )
+        if reference_month not in available_months and available_months:
+            reference_month = max(available_months)
+    base, income, expenses = monthly_totals(all_transactions, reference_month)
+    previous_month = shift_month(reference_month, -1)
+    _, previous_income, previous_expenses = monthly_totals(all_transactions, previous_month)
+    net = income - expenses
+    savings_rate = (net / income * Decimal("100")).quantize(Decimal("0.1")) if income else None
+    expense_change = percentage_change(expenses, previous_expenses)
+
+    category_totals = {}
+    for item in (row for row in base if row.kind == "expense"):
+        allocations = [(split.category, money(split.amount)) for split in item.splits] or [(item.category, money(item.amount))]
+        for category, amount in allocations:
+            name = category.full_name if category else "Sem categoria"
+            color = category.color if category else "#8E8D8A"
+            category_totals.setdefault(name, {"amount": Decimal("0"), "color": color})
+            category_totals[name]["amount"] += amount
+    categories = sorted(
+        ({"name": name, **values} for name, values in category_totals.items()),
+        key=lambda row: row["amount"], reverse=True,
+    )[:6]
+
+    trend = []
+    for offset in range(-5, 1):
+        month = shift_month(reference_month, offset)
+        _, month_income, month_expenses = monthly_totals(all_transactions, month)
+        trend.append({
+            "label": month_label(month, short=True),
+            "income": float(month_income),
+            "expenses": float(month_expenses),
+        })
+
+    guidance = []
+    if previous_expenses and expense_change is not None:
+        if expense_change > 10:
+            guidance.append({"tone": "danger", "title": "Gastos aceleraram", "text": f"Você gastou {expense_change}% a mais que em {month_label(previous_month)}."})
+        elif expense_change < -10:
+            guidance.append({"tone": "success", "title": "Gastos recuaram", "text": f"Você gastou {abs(expense_change)}% a menos que no mês anterior."})
+        else:
+            guidance.append({"tone": "info", "title": "Gastos estáveis", "text": "As despesas ficaram próximas do mês anterior."})
+    if categories and expenses:
+        share = (categories[0]["amount"] / expenses * Decimal("100")).quantize(Decimal("1"))
+        guidance.append({"tone": "warning", "title": "Maior peso do mês", "text": f"{categories[0]['name']} concentrou {share}% das despesas."})
+    if income:
+        guidance.append({
+            "tone": "success" if net >= 0 else "danger",
+            "title": "Resultado positivo" if net >= 0 else "Mês no negativo",
+            "text": f"Sobraram {brl(net)} após as despesas." if net >= 0 else f"As despesas superaram as entradas em {brl(abs(net))}.",
+        })
+    if not guidance:
+        guidance.append({"tone": "info", "title": "Construa seu histórico", "text": "Registre entradas e despesas para liberar comparações mensais."})
+    cash = cash_balance()
+    card_commitment = outstanding_card_commitment()
+    balance = cash - card_commitment
     next_invoice = Invoice.query.filter_by(status="confirmed").order_by(Invoice.reference_month.desc()).first()
     transactions = Transaction.query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).limit(5).all()
-    return render_template("dashboard.html", balance=balance, income=income, expenses=expenses, next_invoice=next_invoice, transactions=transactions, today=today)
+    chart_data = {
+        "trend": trend,
+        "categories": {
+            "labels": [row["name"] for row in categories],
+            "values": [float(row["amount"]) for row in categories],
+            "colors": [row["color"] for row in categories],
+        },
+    }
+    return render_template(
+        "dashboard.html", balance=balance, cash=cash, card_commitment=card_commitment,
+        income=income, expenses=expenses, net=net, savings_rate=savings_rate,
+        expense_change=expense_change, previous_income=previous_income,
+        previous_expenses=previous_expenses, previous_month_name=month_label(previous_month),
+        categories=categories, guidance=guidance, chart_data=chart_data,
+        reference_month=reference_month,
+        month_name=month_label(reference_month), next_invoice=next_invoice,
+        transactions=transactions, today=today,
+    )
 
 
 @main.get("/indicadores")
@@ -509,20 +802,29 @@ def future_invoices():
     except (ValueError, IndexError):
         base_month = date.today().strftime("%Y-%m")
     rows = future_invoice_rows(base_month, 12)
-    total = sum((row["total"] for row in rows), Decimal("0"))
-    next_three = sum((row["total"] for row in rows[:3]), Decimal("0"))
-    largest = max(rows, key=lambda row: row["total"]) if rows else None
+    total = sum((row["expenses_total"] for row in rows), Decimal("0"))
+    total_income = sum((row["income"] for row in rows), Decimal("0"))
+    total_net = total_income - total
+    next_three = sum((row["expenses_total"] for row in rows[:3]), Decimal("0"))
     card_totals = {}
     for row in rows:
         for card in row["cards"]:
             card_totals.setdefault(card["name"], {"amount": Decimal("0"), "color": card["color"]})
             card_totals[card["name"]]["amount"] += card["amount"]
+        if row["other_expenses"]:
+            card_totals.setdefault("Demais gastos", {"amount": Decimal("0"), "color": "#8E8D8A"})
+            card_totals["Demais gastos"]["amount"] += row["other_expenses"]
     chart_data = {
         "labels": [row["short_label"] for row in rows],
-        "values": [float(row["total"]) for row in rows],
+        "expenses": [float(row["expenses_total"]) for row in rows],
+        "income": [float(row["income"]) for row in rows],
         "cards": [{"name": name, "amount": float(value["amount"]), "color": value["color"]} for name, value in card_totals.items()],
     }
-    return render_template("future_invoices.html", base_month=base_month, rows=rows, total=total, next_three=next_three, largest=largest, chart_data=chart_data)
+    return render_template(
+        "future_invoices.html", base_month=base_month, rows=rows, total=total,
+        total_income=total_income, total_net=total_net, next_three=next_three,
+        chart_data=chart_data,
+    )
 
 
 @main.route("/movimentacoes", methods=["GET", "POST"])
@@ -546,7 +848,7 @@ def transactions():
                 kind=request.form["kind"], transaction_date=transaction_date,
                 account_id=request.form.get("account_id") or None, category_id=category_id,
                 card_id=card.id if card else None, notes=request.form.get("notes", "").strip(),
-                competence_month=card_competence_month(card, transaction_date) if card else transaction_date.strftime("%Y-%m"),
+                competence_month=transaction_date.strftime("%Y-%m"),
                 payment_responsibility=responsibility, personal_amount=personal_amount,
             )
             if not transaction.description or transaction.amount <= 0:
@@ -582,7 +884,7 @@ def edit_transaction(item_id):
             item.account_id = request.form.get("account_id") or None
             card = db.session.get(CreditCard, int(request.form["card_id"])) if request.form.get("card_id") else None
             item.card_id = card.id if card else None
-            item.competence_month = card_competence_month(card, item.transaction_date) if card else item.transaction_date.strftime("%Y-%m")
+            item.competence_month = item.transaction_date.strftime("%Y-%m")
             item.payment_responsibility, item.personal_amount = responsibility_values(
                 item.amount,
                 request.form.get("payment_responsibility", "self"),
@@ -804,10 +1106,15 @@ def import_invoice():
         try:
             reference_month = request.form["reference_month"]
             datetime.strptime(reference_month, "%Y-%m")
-            parsed = parse_invoice_pdf(file.stream, reference_month, request.form.get("pdf_password", ""))
+            card = db.get_or_404(CreditCard, int(request.form["card_id"]))
+            parsed = parse_invoice_pdf(
+                file.stream,
+                reference_month,
+                request.form.get("pdf_password", ""),
+                invoice_provider_hint(card),
+            )
             if not parsed["items"]:
                 flash("Não consegui localizar compras automaticamente nesse PDF.", "warning"); return render_template("import_invoice.html", cards=cards, drive_configured=drive_is_configured())
-            card = db.get_or_404(CreditCard, int(request.form["card_id"]))
             invoice = create_invoice_draft(card, parsed, file.filename)
             db.session.commit()
             return redirect(url_for("main.review_invoice", invoice_id=invoice.id))
@@ -869,6 +1176,28 @@ def add_invoice_payment(invoice_id):
     return redirect(url_for("main.invoices", status="confirmed"))
 
 
+@main.post("/faturas/<int:invoice_id>/total")
+@login_required
+def update_invoice_total(invoice_id):
+    invoice = db.get_or_404(Invoice, invoice_id)
+    if MonthlyClose.query.filter_by(reference_month=invoice.reference_month).first():
+        flash("A competência desta fatura está fechada. Reabra o mês antes de editar o total.", "warning")
+        return redirect(url_for("main.invoices"))
+    try:
+        total = form_decimal("total")
+        paid = sum((money(payment.amount) for payment in invoice.payments), Decimal("0"))
+        if total < 0 or total < paid:
+            raise ValueError
+        invoice.total = total
+        invoice.statement_total = total
+        db.session.commit()
+        flash("Total da fatura atualizado. As compras importadas foram preservadas.", "success")
+    except (ValueError, InvalidOperation):
+        db.session.rollback()
+        flash("Informe um total válido, igual ou maior que o valor já pago.", "danger")
+    return redirect(url_for("main.invoices", status=request.form.get("status", "confirmed")))
+
+
 @main.post("/faturas/sincronizar-drive")
 @login_required
 def sync_drive_invoices():
@@ -899,7 +1228,12 @@ def sync_drive_invoices():
             continue
         try:
             downloaded = download_pdf(drive_session, drive_file["id"]).getvalue()
-            parsed = parse_with_saved_passwords(lambda data=downloaded: BytesIO(data), reference_month, cards)
+            parsed = parse_with_saved_passwords(
+                lambda data=downloaded: BytesIO(data),
+                reference_month,
+                cards,
+                invoice_filename_provider_hint(filename, cards),
+            )
             if not parsed["items"]:
                 raise ValueError("Nenhuma compra foi encontrada.")
             adapter = parsed.get("adapter", "generic")
@@ -945,11 +1279,22 @@ def review_invoice(invoice_id):
     categories = category_options("expense")
     suggestion = invoice_review_suggestion(invoice)
     if request.method == "POST":
+        expense_month = invoice_expense_month(invoice.reference_month)
+        if month_is_closed(expense_month):
+            flash(f"A competência {expense_month} está fechada. Reabra o mês antes de confirmar a fatura.", "warning")
+            return render_template("review_invoice.html", invoice=invoice, categories=categories, suggestion=suggestion)
         selected_ids = {int(value) for value in request.form.getlist("selected")}
         closing_date = datetime.strptime(request.form["closing_date"], "%Y-%m-%d").date()
         due_date = datetime.strptime(request.form["due_date"], "%Y-%m-%d").date()
         if closing_date >= due_date:
             flash("O fechamento precisa acontecer antes do vencimento.", "danger")
+            return render_template("review_invoice.html", invoice=invoice, categories=categories, suggestion=suggestion)
+        try:
+            official_total = form_decimal("official_total")
+            if official_total < 0:
+                raise ValueError
+        except (ValueError, InvalidOperation):
+            flash("Informe um valor total válido para a fatura.", "danger")
             return render_template("review_invoice.html", invoice=invoice, categories=categories, suggestion=suggestion)
         total = Decimal("0")
         for item in invoice.items:
@@ -967,11 +1312,11 @@ def review_invoice(invoice_id):
             item.personal_amount = personal_amount
             if item.selected:
                 total += item.amount
-                db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id, source="invoice", installment_current=item.installment_current, installment_total=item.installment_total, competence_month=invoice.reference_month, payment_responsibility=responsibility, personal_amount=personal_amount))
+                db.session.add(Transaction(description=item.description, amount=item.amount, kind="expense", transaction_date=item.purchase_date, card_id=invoice.card_id, category_id=item.category_id, invoice_item_id=item.id, source="invoice", installment_current=item.installment_current, installment_total=item.installment_total, competence_month=expense_month, payment_responsibility=responsibility, personal_amount=personal_amount))
         source = "pdf" if request.form.get("date_source") == "pdf" else "manual"
         upsert_card_cycle(invoice.card, invoice.reference_month, closing_date, due_date, source)
-        official_total = invoice.statement_total
-        invoice.total = Decimal(official_total) if official_total else total
+        invoice.statement_total = official_total
+        invoice.total = official_total
         invoice.status = "confirmed"; db.session.commit()
         session.pop(f"invoice_cycle_{invoice.id}", None)
         flash(f"Fatura importada com {len(selected_ids)} compras e datas atualizadas.", "success")
@@ -998,7 +1343,8 @@ def discard_invoice(invoice_id):
 @login_required
 def delete_invoice_data(invoice_id):
     invoice = db.get_or_404(Invoice, invoice_id)
-    if MonthlyClose.query.filter_by(reference_month=invoice.reference_month).first():
+    expense_month = invoice_expense_month(invoice.reference_month)
+    if MonthlyClose.query.filter(MonthlyClose.reference_month.in_([invoice.reference_month, expense_month])).first():
         flash("A competência desta fatura está fechada. Reabra o mês antes de excluir os dados.", "warning")
         return redirect(url_for("main.invoices"))
 
@@ -1061,10 +1407,26 @@ def financial_calendar():
     materialize_recurring(reference_month)
     events = []
     for row in Transaction.query.filter(Transaction.transaction_date.between(start, end)).all():
-        events.append({"date":row.transaction_date,"title":row.description,"amount":row.amount,"tone":"income" if row.kind == "income" else "expense","detail":"Previsto" if row.status == "planned" else "Realizado"})
+        events.append({"date":row.transaction_date,"title":row.description,"amount":personal_value(row),"tone":"income" if row.kind == "income" else "expense","detail":"Previsto" if row.status == "planned" else "Realizado"})
     for cycle in CardCycle.query.filter(CardCycle.due_date.between(start, end)).all():
-        events.append({"date":cycle.due_date,"title":f"Fatura {cycle.card.name}","amount":None,"tone":"card","detail":"Vencimento"})
-    return render_template("calendar.html", reference_month=reference_month, month_name=month_label(reference_month), events=sorted(events, key=lambda row: row["date"]))
+        invoice = Invoice.query.filter_by(card_id=cycle.card_id, reference_month=cycle.reference_month, status="confirmed").first()
+        events.append({"date":cycle.due_date,"title":f"Fatura {cycle.card.name}","amount":money(invoice.total) if invoice else None,"tone":"card","detail":"Vencimento da fatura"})
+    events = sorted(events, key=lambda row: (row["date"], row["tone"], row["title"]))
+    events_by_day = {}
+    for event in events:
+        events_by_day.setdefault(event["date"].day, []).append(event)
+    weeks = []
+    for week in calendar.Calendar(firstweekday=0).monthdayscalendar(start.year, start.month):
+        weeks.append([{"day": day, "events": events_by_day.get(day, [])} if day else None for day in week])
+    realized_income = sum((money(event["amount"]) for event in events if event["tone"] == "income" and event["detail"] == "Realizado"), Decimal("0"))
+    realized_expenses = sum((money(event["amount"]) for event in events if event["tone"] == "expense" and event["detail"] == "Realizado"), Decimal("0"))
+    planned = sum((money(event["amount"]) for event in events if event["detail"] == "Previsto"), Decimal("0"))
+    return render_template(
+        "calendar.html", reference_month=reference_month, month_name=month_label(reference_month),
+        events=events, weeks=weeks, today=date.today(), realized_income=realized_income,
+        realized_expenses=realized_expenses, planned=planned,
+        previous_month=shift_month(reference_month, -1), next_month=shift_month(reference_month, 1),
+    )
 
 
 @main.route("/metas", methods=["GET", "POST"])
@@ -1129,8 +1491,9 @@ def budget_planning():
 @login_required
 def monthly_closing():
     reference_month = request.values.get("month") or date.today().strftime("%Y-%m")
-    start, end = month_bounds(reference_month); rows = Transaction.query.filter(Transaction.transaction_date.between(start,end), Transaction.status == "confirmed").all()
-    income = sum((Decimal(row.amount) for row in rows if row.kind == "income"), Decimal("0")); expenses = sum((Decimal(row.amount) for row in rows if row.kind == "expense"), Decimal("0"))
+    month_bounds(reference_month)
+    confirmed_rows = Transaction.query.filter(Transaction.status == "confirmed").all()
+    rows, income, expenses = monthly_totals(confirmed_rows, reference_month)
     closed = MonthlyClose.query.filter_by(reference_month=reference_month).first()
     if request.method == "POST" and request.form.get("action") == "close" and not closed:
         snapshot = {"transactions":len(rows),"top":[row.description for row in sorted(rows,key=lambda x:x.amount,reverse=True)[:5]]}
@@ -1166,9 +1529,10 @@ def build_simple_pdf(lines):
 @main.get("/dados/relatorio.pdf")
 @login_required
 def monthly_pdf_report():
-    reference_month=request.args.get("month") or date.today().strftime("%Y-%m"); start,end=month_bounds(reference_month)
-    rows=Transaction.query.filter(Transaction.transaction_date.between(start,end)).order_by(Transaction.transaction_date).all()
-    income=sum((Decimal(x.amount) for x in rows if x.kind=="income"),Decimal("0")); expenses=sum((Decimal(x.amount) for x in rows if x.kind=="expense"),Decimal("0"))
+    reference_month=request.args.get("month") or date.today().strftime("%Y-%m"); month_bounds(reference_month)
+    confirmed_rows=Transaction.query.filter(Transaction.status == "confirmed").all()
+    rows,income,expenses=monthly_totals(confirmed_rows,reference_month)
+    rows=sorted(rows,key=lambda x:(x.transaction_date,x.id))
     lines=["GRANA - RELATORIO MENSAL",month_label(reference_month),"",f"Entradas: {brl(income)}",f"Despesas: {brl(expenses)}",f"Resultado: {brl(income-expenses)}","","MOVIMENTACOES"]
     lines.extend(f"{x.transaction_date:%d/%m} | {x.description[:48]} | {brl(x.amount)}" for x in rows[:42])
     return send_file(BytesIO(build_simple_pdf(lines)),mimetype="application/pdf",as_attachment=True,download_name=f"grana-relatorio-{reference_month}.pdf")
@@ -1240,7 +1604,10 @@ def reprocess_invoice(invoice_id):
             raise DriveAccessError("O PDF não está mais na pasta desse mês no Google Drive.")
         downloaded = download_pdf(drive_session, invoice.drive_file_id).getvalue()
         parsed = parse_with_saved_passwords(
-            lambda data=downloaded: BytesIO(data), invoice.reference_month, cards
+            lambda data=downloaded: BytesIO(data),
+            invoice.reference_month,
+            cards,
+            invoice_provider_hint(invoice.card),
         )
         if not parsed["items"]:
             raise ValueError("Nenhuma compra foi encontrada no novo processamento.")
@@ -1295,29 +1662,256 @@ def investments():
     items = query.order_by(Investment.operation_date.desc(), Investment.id.desc()).all()
 
     all_items = Investment.query.all()
+    position_assets = {row.asset for row in all_items if row.operation in {"Compra", "Venda"}}
+    refresh_asset_quotes(position_assets)
     total_buys = sum((item.total_value for item in all_items if item.operation == "Compra"), Decimal("0"))
     total_sales = sum((item.total_value for item in all_items if item.operation == "Venda"), Decimal("0"))
-    total_receipts = sum((item.total_value for item in all_items if item.operation == "Recebimento"), Decimal("0"))
+    manual_receipts = sum((item.total_value for item in all_items if item.operation == "Recebimento"), Decimal("0"))
+    confirmed_dividends = DividendIncome.query.join(DividendImport).filter(
+        DividendImport.status == "confirmed",
+        DividendIncome.selected.is_(True),
+    ).all()
+    imported_receipts = {}
+    for dividend in confirmed_dividends:
+        imported_receipts[dividend.asset] = imported_receipts.get(dividend.asset, Decimal("0")) + money(dividend.amount)
+    total_receipts = manual_receipts + sum(imported_receipts.values(), Decimal("0"))
     investment_categories = Category.query.filter(func.lower(Category.name).in_(["investimento", "investimentos"])).all()
     category_ids = [item.id for item in investment_categories]
     total_transferred = money(db.session.query(func.sum(Transaction.amount)).filter(Transaction.kind == "expense", Transaction.category_id.in_(category_ids)).scalar()) if category_ids else Decimal("0")
     invested_value = total_buys - total_sales
     broker_balance = total_transferred - total_buys + total_sales + total_receipts
-    positions = []
-    for asset in sorted({row.asset for row in all_items if row.operation in {"Compra","Venda"}}):
-        asset_rows = [row for row in all_items if row.asset == asset]
-        buys = [row for row in asset_rows if row.operation == "Compra"]
-        sales = [row for row in asset_rows if row.operation == "Venda"]
-        quantity = sum((Decimal(row.quantity) for row in buys),Decimal("0"))-sum((Decimal(row.quantity) for row in sales),Decimal("0"))
-        cost = sum((row.total_value + Decimal(row.fees or 0) for row in buys),Decimal("0"))
-        average = cost / sum((Decimal(row.quantity) for row in buys),Decimal("0")) if buys else Decimal("0")
-        quote = AssetPrice.query.filter_by(asset=asset).first(); current_price = Decimal(quote.current_price) if quote else average
-        current_value = quantity * current_price; invested_cost = quantity * average; pnl = current_value-invested_cost
-        receipts = sum((row.total_value for row in asset_rows if row.operation == "Recebimento"),Decimal("0"))
-        positions.append({"asset":asset,"quantity":quantity,"average":average,"current_price":current_price,"current_value":current_value,"pnl":pnl,"return_pct":(pnl/invested_cost*100).quantize(Decimal("0.1")) if invested_cost else None,"receipts":receipts,"updated_at":quote.updated_at if quote else None})
+    positions = build_investment_positions(all_items, imported_receipts)
+    portfolio_value = sum((row["current_value"] for row in positions), Decimal("0"))
+    portfolio_cost = sum((row["invested_cost"] for row in positions), Decimal("0"))
+    portfolio_pnl = portfolio_value - portfolio_cost
+    portfolio_return_pct = (portfolio_pnl / portfolio_cost * 100).quantize(Decimal("0.1")) if portfolio_cost else None
     categories = [row[0] for row in db.session.query(Investment.category).distinct().order_by(Investment.category).all()]
     subcategories = [row[0] for row in db.session.query(Investment.subcategory).filter(Investment.subcategory != "").distinct().order_by(Investment.subcategory).all()]
-    return render_template("investments.html", investments=items, positions=positions, today=date.today(), total_transferred=total_transferred, total_buys=total_buys, total_sales=total_sales, total_receipts=total_receipts, invested_value=invested_value, broker_balance=broker_balance, categories=categories, subcategories=subcategories, filters={"start":start,"end":end,"category":category,"subcategory":subcategory})
+    return render_template(
+        "investments.html", investments=items, positions=positions, today=date.today(),
+        total_transferred=total_transferred, total_buys=total_buys, total_sales=total_sales,
+        total_receipts=total_receipts, invested_value=invested_value, broker_balance=broker_balance,
+        portfolio_value=portfolio_value, portfolio_cost=portfolio_cost, portfolio_pnl=portfolio_pnl,
+        portfolio_return_pct=portfolio_return_pct, brapi_configured=bool(integration_secret("brapi_token")),
+        categories=categories, subcategories=subcategories,
+        filters={"start":start,"end":end,"category":category,"subcategory":subcategory},
+    )
+
+
+@main.get("/investimentos/proventos")
+@login_required
+def dividends():
+    query = DividendIncome.query.join(DividendImport).filter(
+        DividendImport.status == "confirmed",
+        DividendIncome.selected.is_(True),
+    )
+    start = request.args.get("start", "")
+    end = request.args.get("end", "")
+    asset = request.args.get("asset", "").strip().upper()
+    income_type = request.args.get("income_type", "")
+    if start:
+        try:
+            query = query.filter(DividendIncome.payment_date >= datetime.strptime(start, "%Y-%m-%d").date())
+        except ValueError:
+            pass
+    if end:
+        try:
+            query = query.filter(DividendIncome.payment_date <= datetime.strptime(end, "%Y-%m-%d").date())
+        except ValueError:
+            pass
+    if asset:
+        query = query.filter(DividendIncome.asset == asset)
+    if income_type:
+        query = query.filter(DividendIncome.income_type == income_type)
+
+    items = query.order_by(DividendIncome.payment_date.desc(), DividendIncome.id.desc()).all()
+    total = sum((money(item.amount) for item in items), Decimal("0"))
+    today = date.today()
+    year_total = sum((money(item.amount) for item in items if item.payment_date.year == today.year), Decimal("0"))
+    month_total = sum((money(item.amount) for item in items if item.payment_date.year == today.year and item.payment_date.month == today.month), Decimal("0"))
+    asset_totals = {}
+    for item in items:
+        asset_totals[item.asset] = asset_totals.get(item.asset, Decimal("0")) + money(item.amount)
+    top_assets = sorted(asset_totals.items(), key=lambda row: row[1], reverse=True)[:5]
+    all_confirmed = DividendIncome.query.join(DividendImport).filter(
+        DividendImport.status == "confirmed",
+        DividendIncome.selected.is_(True),
+    )
+    assets = [row[0] for row in all_confirmed.with_entities(DividendIncome.asset).distinct().order_by(DividendIncome.asset).all()]
+    income_types = [row[0] for row in all_confirmed.with_entities(DividendIncome.income_type).distinct().order_by(DividendIncome.income_type).all()]
+    pending_imports = DividendImport.query.filter_by(status="draft").order_by(DividendImport.created_at.desc()).all()
+    completed_imports = DividendImport.query.filter_by(status="confirmed").order_by(DividendImport.confirmed_at.desc()).limit(10).all()
+    return render_template(
+        "dividends.html",
+        dividends=items,
+        now_year=today.year,
+        total=total,
+        year_total=year_total,
+        month_total=month_total,
+        top_assets=top_assets,
+        assets=assets,
+        income_types=income_types,
+        pending_imports=pending_imports,
+        completed_imports=completed_imports,
+        drive_configured=drive_is_configured(),
+        filters={"start": start, "end": end, "asset": asset, "income_type": income_type},
+    )
+
+
+@main.post("/investimentos/proventos/sincronizar-drive")
+@login_required
+def sync_drive_dividends():
+    try:
+        drive_session, files = list_dividend_pdfs()
+    except (DriveConfigurationError, DriveAccessError) as exc:
+        flash(str(exc) or "Não foi possível consultar a pasta de proventos.", "danger")
+        return redirect(url_for("main.dividends"))
+
+    results = []
+    for drive_file in files:
+        filename = drive_file["name"]
+        existing_import = DividendImport.query.filter_by(drive_file_id=drive_file["id"]).first()
+        if existing_import:
+            if existing_import.status == "draft":
+                results.append({
+                    "filename": filename,
+                    "status": "Aguardando revisão",
+                    "tone": "warning",
+                    "detail": f"{len(existing_import.items)} proventos aguardam confirmação.",
+                    "import_id": existing_import.id,
+                })
+            else:
+                results.append({"filename": filename, "status": "Já importado", "tone": "muted", "detail": "Nenhuma duplicação foi criada."})
+            continue
+        try:
+            parsed = parse_b3_dividend_pdf(download_pdf(drive_session, drive_file["id"]))
+            fingerprints = {item.fingerprint for item in DividendIncome.query.with_entities(DividendIncome.fingerprint).all()}
+            seen = set()
+            new_items = []
+            for item in parsed["items"]:
+                if item["fingerprint"] not in fingerprints and item["fingerprint"] not in seen:
+                    new_items.append(item)
+                    seen.add(item["fingerprint"])
+            dividend_import = DividendImport(
+                original_filename=filename,
+                drive_file_id=drive_file["id"],
+                period_start=parsed["period_start"],
+                period_end=parsed["period_end"],
+                status="draft" if new_items else "confirmed",
+                confirmed_at=None if new_items else datetime.utcnow(),
+            )
+            db.session.add(dividend_import)
+            db.session.flush()
+            for item in new_items:
+                db.session.add(DividendIncome(
+                    import_id=dividend_import.id,
+                    income_type=item["income_type"],
+                    asset=item["asset"],
+                    asset_name=item["asset_name"],
+                    institution=item["institution"],
+                    quantity=item["quantity"],
+                    unit_value=item["unit_value"],
+                    amount=item["amount"],
+                    payment_date=item["payment_date"],
+                    fingerprint=item["fingerprint"],
+                ))
+            db.session.commit()
+            if new_items:
+                amount = sum((item["amount"] for item in new_items), Decimal("0"))
+                results.append({
+                    "filename": filename,
+                    "status": "Pronto para revisar",
+                    "tone": "success",
+                    "detail": f"{len(new_items)} proventos novos · R$ {amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                    "import_id": dividend_import.id,
+                })
+            else:
+                results.append({"filename": filename, "status": "Sem novidades", "tone": "muted", "detail": "Todos os registros desse PDF já estavam no Grana."})
+        except (DividendStatementError, DriveAccessError, ValueError) as exc:
+            db.session.rollback()
+            results.append({"filename": filename, "status": "Não importado", "tone": "danger", "detail": str(exc)})
+        except Exception:
+            db.session.rollback()
+            results.append({"filename": filename, "status": "Não importado", "tone": "danger", "detail": "O extrato não pôde ser processado."})
+
+    if not files:
+        results.append({"filename": "—", "status": "Pasta vazia", "tone": "muted", "detail": "Adicione um extrato de Movimentação da B3 em PDF."})
+    return render_template("sync_dividend_results.html", results=results)
+
+
+@main.route("/investimentos/proventos/importacoes/<int:import_id>/revisar", methods=["GET", "POST"])
+@login_required
+def review_dividend_import(import_id):
+    dividend_import = db.get_or_404(DividendImport, import_id)
+    if dividend_import.status != "draft":
+        return redirect(url_for("main.dividends"))
+    if request.method == "POST":
+        selected_ids = {int(value) for value in request.form.getlist("selected")}
+        for item in dividend_import.items:
+            item.selected = item.id in selected_ids
+        dividend_import.status = "confirmed"
+        dividend_import.confirmed_at = datetime.utcnow()
+        db.session.commit()
+        selected = [item for item in dividend_import.items if item.selected]
+        amount = sum((money(item.amount) for item in selected), Decimal("0"))
+        flash(f"{len(selected)} proventos confirmados, totalizando R$ {amount:,.2f}.".replace(",", "X").replace(".", ",").replace("X", "."), "success")
+        return redirect(url_for("main.dividends"))
+    return render_template("review_dividend_import.html", dividend_import=dividend_import)
+
+
+@main.post("/investimentos/proventos/importacoes/<int:import_id>/excluir")
+@login_required
+def delete_dividend_import(import_id):
+    dividend_import = db.get_or_404(DividendImport, import_id)
+    db.session.delete(dividend_import)
+    db.session.commit()
+    flash("Importação removida. O PDF poderá ser processado novamente.", "success")
+    return redirect(url_for("main.dividends"))
+
+
+@main.post("/investimentos/brapi")
+@login_required
+def configure_brapi():
+    if request.form.get("action") == "clear":
+        setting = IntegrationSetting.query.filter_by(key="brapi_token").first()
+        if setting:
+            db.session.delete(setting)
+            db.session.commit()
+        flash("Integração com a Brapi removida.", "success")
+        return redirect(url_for("main.investments"))
+
+    token = request.form.get("token", "").strip()
+    if not token:
+        flash("Informe a chave da Brapi.", "danger")
+        return redirect(url_for("main.investments"))
+    try:
+        first_asset = db.session.query(Investment.asset).filter(Investment.operation == "Compra").first()
+        fetch_brapi_quote(first_asset[0] if first_asset else "PETR4", token)
+        setting = IntegrationSetting.query.filter_by(key="brapi_token").first()
+        if not setting:
+            setting = IntegrationSetting(key="brapi_token", encrypted_value="")
+        setting.encrypted_value = encrypt_secret(token)
+        db.session.add(setting)
+        db.session.commit()
+        flash("Brapi conectada. As cotações serão atualizadas automaticamente.", "success")
+    except MarketDataError as exc:
+        db.session.rollback()
+        flash(str(exc), "danger")
+    return redirect(url_for("main.investments"))
+
+
+@main.post("/investimentos/cotacoes/atualizar")
+@login_required
+def refresh_investment_prices():
+    assets = [row[0] for row in db.session.query(Investment.asset).filter(Investment.operation.in_(["Compra", "Venda"])).distinct().all()]
+    result = refresh_asset_quotes(assets, force=True)
+    if not result["configured"]:
+        flash("Configure a chave da Brapi antes de atualizar as cotações.", "warning")
+    elif result["errors"]:
+        flash(f"{result['updated']} cotação(ões) atualizada(s). " + " · ".join(result["errors"]), "warning")
+    else:
+        flash(f"{result['updated']} cotação(ões) atualizada(s) pela Brapi.", "success")
+    return redirect(url_for("main.investments"))
 
 
 @main.post("/investimentos/cotacao")
@@ -1327,7 +1921,7 @@ def update_asset_price():
         asset=request.form["asset"].strip().upper(); price=form_decimal("current_price")
         if not asset or price<=0: raise ValueError
         quote=AssetPrice.query.filter_by(asset=asset).first() or AssetPrice(asset=asset,current_price=price)
-        quote.current_price=price; db.session.add(quote); db.session.commit(); flash("Cotação atualizada.", "success")
+        quote.current_price=price; quote.source="manual"; quote.change_percent=None; quote.last_attempt_at=datetime.utcnow(); db.session.add(quote); db.session.commit(); flash("Cotação atualizada.", "success")
     except (ValueError,InvalidOperation):
         db.session.rollback(); flash("Informe ativo e cotação válidos.", "danger")
     return redirect(url_for("main.investments"))

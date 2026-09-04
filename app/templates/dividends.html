@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+{% block title %}Proventos · Grana{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div><span class="eyebrow">RENDA DA CARTEIRA</span><h1>Proventos</h1><p>Dividendos, JCP e rendimentos efetivamente creditados pela B3.</p></div>
+  <div class="page-actions"><a class="secondary-button" href="{{ url_for('main.investments') }}">← Investimentos</a></div>
+</header>
+
+<section class="investment-hero">
+  <div><span>ESTE MÊS</span><strong>{{ month_total|brl }}</strong><small>Pagamentos confirmados</small></div>
+  <div class="investment-hero-main"><span>NO ANO</span><strong>{{ year_total|brl }}</strong><small>Proventos recebidos em {{ now_year if now_year else '' }}</small></div>
+  <div><span>PERÍODO FILTRADO</span><strong>{{ total|brl }}</strong><small>{{ dividends|length }} lançamentos</small></div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><div><span>EXTRATO DA B3</span><h2>Sincronizar pelo Google Drive</h2></div><span class="operation-chip {{ 'compra' if drive_configured else 'venda' }}">{{ 'Disponível' if drive_configured else 'Não configurado' }}</span></div>
+  <p class="helper-text">Adicione os PDFs em <strong>Faturas Grana / 00 - Proventos</strong>. Arquivos e lançamentos já processados não serão duplicados.</p>
+  {% if drive_configured %}<form method="post" action="{{ url_for('main.sync_drive_dividends') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="primary-button">↻ Buscar extratos no Drive</button></form>{% endif %}
+</section>
+
+{% if pending_imports %}<section class="panel table-panel"><div class="panel-head"><div><span>PENDÊNCIAS</span><h2>Extratos aguardando revisão</h2></div></div><div class="table-wrap"><table><thead><tr><th>Arquivo</th><th>Período</th><th>Itens</th><th></th></tr></thead><tbody>{% for row in pending_imports %}<tr><td><strong>{{ row.original_filename }}</strong></td><td>{{ row.period_start.strftime('%d/%m/%Y') }} a {{ row.period_end.strftime('%d/%m/%Y') }}</td><td>{{ row.items|length }}</td><td><a class="table-action" href="{{ url_for('main.review_dividend_import', import_id=row.id) }}">Revisar →</a></td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
+
+{% if top_assets %}<section class="panel table-panel"><div class="panel-head"><div><span>DESTAQUES</span><h2>Maiores pagadores no filtro atual</h2></div></div><div class="table-wrap"><table><thead><tr><th>Ativo</th><th>Total recebido</th></tr></thead><tbody>{% for asset, amount in top_assets %}<tr><td><strong>{{ asset }}</strong></td><td class="positive">{{ amount|brl }}</td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
+
+<section class="panel filter-panel"><form method="get" class="filter-row"><label>De<input type="date" name="start" value="{{ filters.start }}"></label><label>Até<input type="date" name="end" value="{{ filters.end }}"></label><label>Ativo<select name="asset"><option value="">Todos</option>{% for value in assets %}<option value="{{ value }}" {{ 'selected' if filters.asset == value }}>{{ value }}</option>{% endfor %}</select></label><label>Tipo<select name="income_type"><option value="">Todos</option>{% for value in income_types %}<option value="{{ value }}" {{ 'selected' if filters.income_type == value }}>{{ value }}</option>{% endfor %}</select></label><button class="secondary-button">Filtrar</button><a href="{{ url_for('main.dividends') }}">Limpar</a></form></section>
+
+<section class="panel table-panel"><div class="panel-head"><div><span>HISTÓRICO</span><h2>Proventos recebidos</h2></div></div><div class="table-wrap"><table><thead><tr><th>Pagamento</th><th>Ativo</th><th>Tipo</th><th>Quantidade</th><th>Valor por ativo</th><th>Valor creditado</th></tr></thead><tbody>{% for item in dividends %}<tr><td>{{ item.payment_date.strftime('%d/%m/%Y') }}</td><td><strong>{{ item.asset }}</strong>{% if item.asset_name %}<small class="table-subtitle">{{ item.asset_name }}</small>{% endif %}</td><td>{{ item.income_type }}</td><td>{{ ('%.8f'|format(item.quantity)).rstrip('0').rstrip('.') }}</td><td>{{ item.unit_value|brl }}</td><td class="positive"><strong>{{ item.amount|brl }}</strong></td></tr>{% else %}<tr><td colspan="6" class="empty">Nenhum provento confirmado.</td></tr>{% endfor %}</tbody></table></div></section>
+
+{% if completed_imports %}<section class="panel table-panel"><div class="panel-head"><div><span>ARQUIVOS</span><h2>Extratos processados</h2></div></div><div class="table-wrap"><table><thead><tr><th>Arquivo</th><th>Período</th><th>Registros</th><th></th></tr></thead><tbody>{% for row in completed_imports %}<tr><td><strong>{{ row.original_filename }}</strong></td><td>{{ row.period_start.strftime('%d/%m/%Y') if row.period_start else '—' }} a {{ row.period_end.strftime('%d/%m/%Y') if row.period_end else '—' }}</td><td>{{ row.items|selectattr('selected')|list|length }}</td><td><form method="post" action="{{ url_for('main.delete_dividend_import', import_id=row.id) }}" onsubmit="return confirm('Excluir os proventos deste extrato e permitir nova importação?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="danger-link">Excluir</button></form></td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
+{% endblock %}

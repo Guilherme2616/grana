@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 
@@ -6,10 +6,11 @@ import pytest
 
 from app import create_app
 from app.extensions import db
-from app.models import Account, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
+from app.models import Account, AssetPrice, CardCycle, Category, CategoryRule, CreditCard, FinancialGoal, IntegrationSetting, Investment, Invoice, InvoiceItem, InvoicePayment, MonthlyClose, RecurringTransaction, Transaction, TransactionSplit, User
 from app.services.drive_sync import month_folder_matches, normalize_folder_name
 from app.services.financial_analytics import build_installment_projection, month_label, shift_month
 from app.services.invoice_parser import (
+    _normalize_bb_ocr_text,
     detect_bb_statement_total,
     detect_due_date,
     is_banco_inter_invoice,
@@ -27,6 +28,7 @@ from app.services.invoice_parser import (
     parse_itau_text,
     parse_invoice_pdf,
 )
+from app.services.market_data import fetch_brapi_quote
 from app.services.secret_store import decrypt_secret
 
 
@@ -97,10 +99,10 @@ def test_card_competence_responsibility_and_invoice_payment_cash(client, app):
         db.session.add(invoice); db.session.commit(); invoice_id = invoice.id
 
     client.post(f"/faturas/{invoice_id}/pagamentos", data={
-        "amount": "60,00", "payment_date": "2026-09-28", "paid_by": "self", "account_id": ids[0],
+        "amount": "60,00", "payment_date": date.today().isoformat(), "paid_by": "self", "account_id": ids[0],
     }, follow_redirects=True)
     client.post(f"/faturas/{invoice_id}/pagamentos", data={
-        "amount": "40,00", "payment_date": "2026-09-28", "paid_by": "parents",
+        "amount": "40,00", "payment_date": date.today().isoformat(), "paid_by": "parents",
     }, follow_redirects=True)
     with app.app_context():
         payments = InvoicePayment.query.order_by(InvoicePayment.id).all()
@@ -179,6 +181,7 @@ def test_money_and_date_parser():
     assert parse_brl("R$ 1.234,56") == Decimal("1234.56")
     assert parse_brl("R$ 661,26-") == Decimal("-661.26")
     assert parse_date("15/07", "2026-08") == date(2026, 7, 15)
+    assert parse_date("28/11", "2026-08") == date(2025, 11, 28)
     assert detect_due_date("Data de vencimento: 28/08/2026", "2026-08") == date(2026, 8, 28)
     assert detect_due_date("Vencimento\n10/08/2026", "2026-08") == date(2026, 8, 10)
 
@@ -241,6 +244,33 @@ def test_bb_smiles_adapter_accepts_alternate_heading_and_country_after_amount():
     assert items[1]["installment_current"] == 1
     assert items[1]["installment_total"] == 12
     assert sum(item["amount"] for item in items) == Decimal("108.90")
+
+
+def test_bb_adapter_accepts_ourocard_without_smiles_wrapped_rows_and_foreign_amount():
+    extracted_text = """
+    Ourocard Visa Infinite
+    Banco do Brasil
+    Total da fatura
+    1.284,56
+    Data de vencimento 16/06/2025
+
+    Compras na fatura
+    Data Descrição País Valor
+    02/05 AMAZON AWS SERVICOS
+    SAO PAULO BR 184,56
+    04/05 COMPRA INTERNACIONAL USD 20,00 US R$ 100,00
+    Data Descrição País Valor
+    06/05 LOJA BRASILEIRA BR 1.000,00
+    Total da fatura R$ 1.284,56
+    Compras parceladas próximas faturas
+    07/05 NAO IMPORTAR BR 50,00
+    """
+    assert is_bb_smiles_invoice(extracted_text)
+    assert detect_bb_statement_total(extracted_text) == Decimal("1284.56")
+    items = parse_bb_smiles_text(extracted_text, "2025-06")
+    assert [item["amount"] for item in items] == [Decimal("184.56"), Decimal("100.00"), Decimal("1000.00")]
+    assert items[0]["description"] == "AMAZON AWS SERVICOS SAO PAULO"
+    assert all("NAO IMPORTAR" not in item["description"] for item in items)
 
 
 def test_mercado_pago_adapter_ignores_payments_and_reads_installments():
@@ -370,6 +400,227 @@ def test_itau_adapter_reads_side_by_side_rows_and_reconciles_totals():
     assert all("10/10" not in item["description"] for item in items)
 
 
+def test_itau_adapter_keeps_old_purchases_installments_and_wrapped_rows():
+    details = """
+    LANÇAMENTOS DO CARTÃO
+    DATA ESTABELECIMENTO VALOR EM R$
+       18/02 NOTEBOOK LOJA XPTO PARC 07/12 299,90
+     03/07 COMPRA DO MES 45,10
+    21/11 CURSO ONLINE PARCELA 09 DE 10
+    SAO PAULO 120,00
+    Total dos lançamentos atuais 465,00
+    Compras parceladas - próximas faturas
+    18/02 NOTEBOOK LOJA XPTO PARC 08/12 299,90
+    """
+    items = parse_itau_text(details, "2026-08")
+    assert [item["amount"] for item in items] == [Decimal("299.90"), Decimal("45.10"), Decimal("120.00")]
+    assert items[0]["purchase_date"] == date(2026, 2, 18)
+    assert items[0]["installment_current"] == 7
+    assert items[0]["installment_total"] == 12
+    assert items[2]["installment_current"] == 9
+    assert items[2]["installment_total"] == 10
+    assert all("08/12" not in item["description"] for item in items)
+
+
+def test_itau_adapter_does_not_treat_spaced_installment_as_a_second_date():
+    details = """
+    LANÇAMENTOS: COMPRAS E SAQUES
+    28/11 GRUPO CASAS BAHIA        09/10       309,89        05/07 ILUANA BEATRIZ GERALDOAD 38,13
+    23/02 IEV ADAMANTINA           06/10        57,50        07/07 AUTO POSTO CARREIROADAM 50,00
+    Total dos lançamentos atuais 455,52
+    """
+    items = parse_itau_text(details, "2026-08")
+    assert [item["description"] for item in items] == [
+        "GRUPO CASAS BAHIA 09/10", "ILUANA BEATRIZ GERALDOAD",
+        "IEV ADAMANTINA 06/10", "AUTO POSTO CARREIROADAM",
+    ]
+    assert sum(item["amount"] for item in items) == Decimal("455.52")
+    assert items[0]["purchase_date"] == date(2025, 11, 28)
+
+
+def test_itau_adapter_reads_left_column_when_category_follows_amount():
+    details = """
+    LANÇAMENTOS: COMPRAS E SAQUES
+     28/11 GRUPO CASAS BAHIA 09/10       309,89                      supermercado ADAMANTINA
+     vestuário ADAMANTINA                                             05/07 LUANA BEATRIZ GERALDOAD 38,13
+     23/02 IEV ADAMANTINA 06/10            57,50                      restaurante ADAMANTINA
+     saúde ADAMANTINA                                                07/07 AUTO POSTO CARREIROADAM 50,00
+    Total dos lançamentos atuais 455,52
+    """
+    items = parse_itau_text(details, "2026-08")
+    assert [item["description"] for item in items] == [
+        "GRUPO CASAS BAHIA 09/10", "LUANA BEATRIZ GERALDOAD",
+        "IEV ADAMANTINA 06/10", "AUTO POSTO CARREIROADAM",
+    ]
+    assert sum(item["amount"] for item in items) == Decimal("455.52")
+
+
+def test_itau_adapter_keeps_indented_right_column_after_left_column():
+    details = (
+        "LANÇAMENTOS: COMPRAS E SAQUES\n"
+        " 28/11 GRUPO CASAS BAHIA 09/10 309,89 supermercado ADAMANTINA\n"
+        + (" " * 140) + "05/07 LUANA BEATRIZ GERALDOAD 6,00\n"
+        "Total dos lançamentos atuais 315,89\n"
+    )
+    items = parse_itau_text(details, "2026-08")
+    assert [item["description"] for item in items] == [
+        "GRUPO CASAS BAHIA 09/10", "LUANA BEATRIZ GERALDOAD",
+    ]
+
+
+def test_itau_screenshot_values_reconcile_purchases_products_and_fees():
+    purchase_amounts = """
+    28/11 GRUPO CASAS B 09/10 309,89
+    23/02 IEV ADAMANTINA 06/10 57,50
+    12/03 MADAME CALCADOS 05/10 51,98
+    22/04 GUERINO SECCO 04/06 105,50
+    04/05 FARMACIA SANTA 03/03 33,29
+    10/05 GUERINO SECCO 03/06 73,33
+    10/05 HOTELTOBARUERI 03/10 40,07
+    10/05 KINGS PAPURO 03/10 89,99
+    19/05 GESA TEXSAO P 03/03 117,00
+    19/05 Copatec Corner 03/03 53,16
+    20/05 PIRACICABANA S 03/06 47,05
+    22/05 LOCCITANE PA 03/03 56,00
+    31/05 PAG*SteamSao P 03/04 48,89
+    12/06 MARTA L N K. 02/02 62,45
+    04/07 LARISSA BORGES RONDON 37,40
+    05/07 ILUANA BEATRIZ GERALDOAD 38,13
+    05/07 ILUANA BEATRIZ GERALDOAD 6,00
+    07/07 AUTO POSTO CARREIROADAM 50,00
+    07/07 SUPERMERCADO RAVAZIADAM 32,67
+    09/07 DFINCOLAS RGDIM BENA 38,81
+    09/07 EBN *PLATSTATIONCURI 74,90
+    10/07 TOTALPASS SAO PAULO 79,90
+    10/07 SUPERMERCADO RAVAZIADAM 11,28
+    11/07 JM.COM-LANCHONETE READ 40,00
+    12/07 IFOOD DOCE LOCOSacoBRA 5,95
+    12/07 THE BEST ACAIOSVALDO CR 25,96
+    13/07 BLENDS BARDAMANTINABRA 35,51
+    17/07 VIA SABORADAMANTINABRA 28,69
+    18/07 BarSaHimiADAMANTINABRA 70,80
+    18/07 CineHotADAMANTINABRA 50,00
+    22/07 BARACA ARAZONADAMANT 47,00
+    23/07 SUPERMERCADO RAVAZIADAM 22,17
+    26/07 MARCIA REGINA GRECOPENA 48,00
+    28/07 AGD EVENTOSDRA 01/02 60,00
+    28/07 SUPERMERCADO RAVAZIADAM 11,84
+    28/07 AUTO POSTO CARREIROADAM 50,00
+    29/07 CONVENIENCIA DO LUIZADA 96,00
+    31/07 SUPERMERCADO RAVAZIADAM 30,67
+    31/07 SUPERMERCADO RAVAZIADAM 59,94
+    """
+    details = f"""
+    LANÇAMENTOS: COMPRAS E SAQUES
+    {purchase_amounts}
+    Lançamentos no cartão 2.197,72
+    Lançamentos: produtos e serviços
+    02/07 Mensalidade - Plano do Anuidade Diferenciada 88,00
+    Lançamentos produtos e serviços 88,00
+    Total dos lançamentos atuais 2.285,72
+    Compras parceladas - próximas faturas
+    28/11 GRUPO CASAS B 10/10 309,89
+    Encargos cobrados nesta fatura
+    Juros do rotativo 12,50 % aa 10,32
+    Juros de mora 1,00 % am 0,93
+    Multa por atraso 2,00 % 55,78
+    IOF de financiamento 10,83
+    Total de encargos em R$ 77,86
+    """
+    items = parse_itau_text(details, "2026-08")
+    assert len(items) == 44
+    assert sum(item["amount"] for item in items) == Decimal("2363.58")
+    assert sum(item["amount"] for item in items if item["description"].startswith("Encargo Itaú")) == Decimal("77.86")
+
+
+def test_bb_screenshot_values_reconcile_exactly():
+    details = """
+    Lançamentos nesta fatura
+    Data Descrição País Valor
+    01- GUILHERME N Cartão N. 0921
+    Pagamentos
+    06/07 PGTO. CASH AG. 0470 000047000 200 10 R$ 661,26-
+    Compras diversas
+    07/07 APPLE.COM/BILL SAO PAULO BR R$ 66,90
+    13/07 TOTALPASS SAO PAULO BR R$ 59,90
+    Compras por mala direta/telefone
+    15/07 Smiles Clube Smiles Barueri BR R$ 46,00
+    Compras/Pgto Contas Parc
+    Companhias aereas
+    29/04 GOL LINHAS A* PARC 03/05 SAO PAULO BR R$ 30,80
+    Compras por mala direta/telefone
+    23/07 CLUBE LIVELO* PARC 01/12 SANTANA DE P BR R$ 42,71
+    Data Descrição País Valor
+    Anuidades
+    28/07 ANUIDADE DIFERENCIADA TIT-PARC 05/12 BR R$ 48,00
+    Subtotal R$ 294,31
+    Total R$ 294,31
+    Parcelamentos Próxima Fatura
+    29/04 GOL LINHAS A* PARC 04/05 SAO PAULO BR R$ 30,80
+    """
+    items = parse_bb_smiles_text(details, "2026-08")
+    assert len(items) == 6
+    assert sum(item["amount"] for item in items) == Decimal("294.31")
+
+
+def test_bb_adapter_falls_back_to_rows_when_heading_is_an_image():
+    text_layer = """
+    06/07 PGTO. CASH AG. 0470 000047000 200 10 R$ 661,26-
+    07/07 APPLE.COM/BILL SAO PAULO BR R$ 66,90
+    13/07 TOTALPASS SAO PAULO BR R$ 59,90
+    15/07 Smiles Clube Smiles Barueri BR R$ 46,00
+    29/04 GOL LINHAS A* PARC 03/05 SAO PAULO BR R$ 30,80
+    23/07 CLUBE LIVELO* PARC 01/12 SANTANA DE P BR R$ 42,71
+    28/07 ANUIDADE DIFERENCIADA TIT-PARC 05/12 BR R$ 48,00
+    Total R$ 294,31
+    """
+    items = parse_bb_smiles_text(text_layer, "2026-08")
+    assert len(items) == 6
+    assert sum(item["amount"] for item in items) == Decimal("294.31")
+
+
+def test_bb_scanned_pdf_uses_ocr_fallback(monkeypatch):
+    pages = ["", "", ""]
+    ocr_pages = ["""
+    Banco do Brasil
+    SMILES PLATINUM VISA
+    Valor R$ 294,31
+    Vencimento 10/08/2026
+    Lançamentos nesta fatura
+    Data Descrição País Valor
+    06/07 PGTO. CASH AG. 0470 R$ 661,26
+    07/07 APPLE.COM/BILL SAO PAULO BR R$ 66,90
+    13/07 TOTALPASS SAO PAULO BR R$ 59,90
+    15/07 Smiles Clube Smiles Barueri BR R$ 46,00
+    29/04 GOL LINHAS A* PARC 03/05 SAO PAULO BR R$ 30,80
+    23/07 CLUBE LIVELO* PARC 01/12 SANTANA DE P BR R$ 42,71
+    28/07 ANUIDADE DIFERENCIADA TIT-PARC 05/12 BR R$ 48,00
+    Total R$ 294,31
+    """, "", ""]
+
+    class FakeReader:
+        is_encrypted = False
+        def __init__(self, stream):
+            self.pages = []
+
+    monkeypatch.setattr("app.services.invoice_parser.PdfReader", FakeReader)
+    monkeypatch.setattr("app.services.invoice_parser.extract_pdf_pages", lambda reader: pages)
+    monkeypatch.setattr("app.services.invoice_parser.ocr_pdf_pages", lambda reader: ocr_pages)
+    parsed = parse_invoice_pdf(BytesIO(b"pdf"), "2026-08", expected_provider="bb_smiles")
+    assert parsed["adapter"] == "bb_smiles"
+    assert len(parsed["items"]) == 6
+    assert sum(item["amount"] for item in parsed["items"]) == Decimal("294.31")
+
+
+def test_bb_ocr_normalizes_confused_date_without_changing_description():
+    recognized = "1g/o8 | EC *PARC 01/02 BARUERI BR R$ 30,80\n"
+    normalized = _normalize_bb_ocr_text(recognized)
+    assert normalized == "18/08 | EC *PARC 01/02 BARUERI BR R$ 30,80\n"
+    items = parse_bb_smiles_text(normalized, "2026-09")
+    assert len(items) == 1
+    assert items[0]["amount"] == Decimal("30.80")
+
+
 def test_itau_pdf_reads_current_purchases_beyond_third_page(monkeypatch):
     pages = [
         """Itaú Personnalité\nO total da sua fatura é: R$ 60,00\nVencimento 10/08/2026\nLimite total de crédito R$ 15.000,00""",
@@ -443,7 +694,7 @@ def test_drive_sync_creates_draft_and_recovers_pending_review(client, app, monke
     }
     monkeypatch.setattr("app.routes.list_month_pdfs", lambda month: (object(), [fake_file]))
     monkeypatch.setattr("app.routes.download_pdf", lambda drive_session, file_id: BytesIO(b"pdf"))
-    monkeypatch.setattr("app.routes.parse_with_saved_passwords", lambda factory, month, cards: parsed)
+    monkeypatch.setattr("app.routes.parse_with_saved_passwords", lambda factory, month, cards, expected_provider="": parsed)
 
     response = client.post("/faturas/sincronizar-drive", data={"reference_month": "2026-08"})
     assert response.status_code == 200
@@ -541,6 +792,30 @@ def test_delete_invoice_is_blocked_for_closed_month(client, app):
         assert db.session.get(Invoice, invoice_id) is not None
 
 
+def test_edit_invoice_total_preserves_items_and_rejects_value_below_payments(client, app):
+    login(client)
+    with app.app_context():
+        account = Account.query.first()
+        invoice = Invoice(card_id=CreditCard.query.first().id, reference_month="2026-08", total=Decimal("100.00"), statement_total=Decimal("100.00"), status="confirmed")
+        db.session.add(invoice); db.session.flush()
+        item = InvoiceItem(invoice_id=invoice.id, purchase_date=date(2026, 8, 1), description="COMPRA", amount=Decimal("80.00"))
+        payment = InvoicePayment(invoice_id=invoice.id, account_id=account.id, amount=Decimal("60.00"), payment_date=date(2026, 8, 10), paid_by="self")
+        db.session.add_all([item, payment]); db.session.commit(); invoice_id = invoice.id
+
+    response = client.post(f"/faturas/{invoice_id}/total", data={"total": "120,50"}, follow_redirects=True)
+    assert "Total da fatura atualizado" in response.text
+    with app.app_context():
+        invoice = db.session.get(Invoice, invoice_id)
+        assert invoice.total == Decimal("120.50")
+        assert invoice.statement_total == Decimal("120.50")
+        assert len(invoice.items) == 1
+
+    response = client.post(f"/faturas/{invoice_id}/total", data={"total": "50,00"}, follow_redirects=True)
+    assert "igual ou maior que o valor já pago" in response.text
+    with app.app_context():
+        assert db.session.get(Invoice, invoice_id).total == Decimal("120.50")
+
+
 def test_reprocess_drive_draft_replaces_items(client, app, monkeypatch):
     login(client)
     with app.app_context():
@@ -586,7 +861,7 @@ def test_reprocess_drive_draft_replaces_items(client, app, monkeypatch):
         lambda month: (object(), [{"id": "drive-file-reprocess", "name": "BB Smiles.pdf"}]),
     )
     monkeypatch.setattr("app.routes.download_pdf", lambda drive_session, file_id: BytesIO(b"pdf"))
-    monkeypatch.setattr("app.routes.parse_with_saved_passwords", lambda factory, month, cards: parsed)
+    monkeypatch.setattr("app.routes.parse_with_saved_passwords", lambda factory, month, cards, expected_provider="": parsed)
 
     response = client.post(f"/faturas/{invoice_id}/reprocessar", follow_redirects=True)
     assert response.status_code == 200
@@ -629,6 +904,115 @@ def test_financial_indicators_provisioning_and_simulator_pages(client, app):
     assert "IR regressivo" in simulator.text
 
 
+def test_dashboard_uses_latest_month_and_deducts_unpaid_card_commitment(client, app):
+    login(client)
+    with app.app_context():
+        Account.query.first().initial_balance = Decimal("0.00")
+        card = CreditCard.query.first()
+        category = Category.query.first()
+        db.session.add(Transaction(
+            description="Salário", amount=Decimal("1000.00"), kind="income",
+            transaction_date=date(2026, 8, 5), account_id=Account.query.first().id,
+            category_id=None, competence_month=None,
+        ))
+        invoice = Invoice(card_id=card.id, reference_month="2026-08", total=Decimal("300.00"), status="confirmed")
+        db.session.add(invoice); db.session.flush()
+        item = InvoiceItem(
+            invoice_id=invoice.id, purchase_date=date(2026, 8, 10), description="Compra no cartão",
+            amount=Decimal("300.00"), selected=True, category_id=category.id,
+            payment_responsibility="self", personal_amount=Decimal("300.00"),
+        )
+        db.session.add(item); db.session.flush()
+        db.session.add(Transaction(
+            description=item.description, amount=item.amount, kind="expense",
+            transaction_date=item.purchase_date, card_id=card.id, category_id=category.id,
+            invoice_item_id=item.id, competence_month="2026-08", source="invoice",
+            payment_responsibility="self", personal_amount=Decimal("300.00"),
+        ))
+        db.session.add(Transaction(
+            description="Conta de luz", amount=Decimal("100.00"), kind="expense",
+            transaction_date=date(2026, 8, 15), account_id=Account.query.first().id,
+            category_id=category.id, competence_month="2026-08",
+        ))
+        db.session.commit()
+
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "Agosto/2026" in response.text
+    assert "R$ 600,00" in response.text
+    assert "Em contas: R$ 900,00" in response.text
+    assert "Comprometido nos cartões: R$ 300,00" in response.text
+    assert "R$ 1.000,00" in response.text
+    assert "R$ 400,00" in response.text
+
+
+def test_dashboard_counts_invoice_in_payment_month_without_duplicating_competence(client, app):
+    login(client)
+    with app.app_context():
+        card = CreditCard.query.first()
+        category = Category.query.first()
+        invoice = Invoice(
+            card_id=card.id, reference_month="2026-09",
+            total=Decimal("80.00"), status="confirmed",
+        )
+        db.session.add(invoice); db.session.flush()
+        item = InvoiceItem(
+            invoice_id=invoice.id, purchase_date=date(2026, 8, 15),
+            description="COMPRA DE AGOSTO", amount=Decimal("80.00"),
+            selected=True, category_id=category.id,
+            payment_responsibility="split", personal_amount=Decimal("30.00"),
+        )
+        db.session.add(item); db.session.flush()
+        db.session.add(Transaction(
+            description=item.description, amount=item.amount, kind="expense",
+            transaction_date=item.purchase_date, card_id=card.id,
+            category_id=category.id, invoice_item_id=item.id,
+            competence_month="2026-08", source="invoice",
+            payment_responsibility="split", personal_amount=Decimal("30.00"),
+        ))
+        db.session.commit()
+
+    september = client.get("/?month=2026-09")
+    august = client.get("/?month=2026-08")
+    assert "Saídas · Setembro/2026</span><strong>R$ 80,00" in september.text
+    assert "Comprometido nos cartões: R$ 80,00" in september.text
+    assert "Saídas · Agosto/2026</span><strong>R$ 0,00" in august.text
+
+
+def test_future_invoices_compares_cashflow_and_lists_other_expenses(client, app):
+    login(client)
+    with app.app_context():
+        card = CreditCard.query.first()
+        account = Account.query.first()
+        category = Category.query.first()
+        invoice = Invoice(card_id=card.id, reference_month="2026-08", total=Decimal("100.00"), status="confirmed")
+        db.session.add(invoice); db.session.flush()
+        db.session.add(InvoiceItem(
+            invoice_id=invoice.id, purchase_date=date(2026, 8, 2), description="NOTEBOOK PARC 03/10",
+            amount=Decimal("100.00"), installment_current=3, installment_total=10, selected=True,
+        ))
+        db.session.add_all([
+            Transaction(
+                description="Salário futuro", amount=Decimal("500.00"), kind="income",
+                transaction_date=date(2026, 9, 5), account_id=account.id,
+            ),
+            Transaction(
+                description="Aluguel", amount=Decimal("50.00"), kind="expense",
+                transaction_date=date(2026, 9, 6), account_id=account.id, category_id=category.id,
+                competence_month="2026-09",
+            ),
+        ])
+        db.session.commit()
+
+    response = client.get("/proximas-faturas?month=2026-08")
+    assert response.status_code == 200
+    assert "Demais gastos" in response.text
+    assert "Despesas fora dos cartões" in response.text
+    assert "R$ 500,00" in response.text
+    assert "R$ 150,00" in response.text
+    assert "R$ 350,00" in response.text
+
+
 def test_monthly_card_cycle(client, app):
     login(client)
     with app.app_context():
@@ -654,3 +1038,87 @@ def test_create_investment(client, app):
     assert "RZAG11" in response.text
     with app.app_context():
         assert Investment.query.first().total_value == Decimal("95.0000000000")
+
+
+def test_brapi_quote_parser(monkeypatch):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"results": [{"symbol": "RZAG11", "data": {
+                "shortName": "Riza Agro FIAGRO",
+                "regularMarketPrice": 8.73,
+                "regularMarketChangePercent": -0.42,
+            }}]}
+
+    monkeypatch.setattr("app.services.market_data.requests.get", lambda *args, **kwargs: Response())
+    quote = fetch_brapi_quote("rzag11", "token-seguro")
+    assert quote["asset"] == "RZAG11"
+    assert quote["price"] == Decimal("8.73")
+    assert quote["change_percent"] == Decimal("-0.42")
+
+
+def test_brapi_configuration_auto_refresh_and_cache(client, app, monkeypatch):
+    login(client)
+    calls = []
+
+    def fake_quote(asset, token):
+        calls.append((asset, token))
+        return {
+            "asset": asset,
+            "name": "Riza Agro FIAGRO",
+            "price": Decimal("8.73"),
+            "change_percent": Decimal("1.25"),
+        }
+
+    monkeypatch.setattr("app.routes.fetch_brapi_quote", fake_quote)
+    with app.app_context():
+        db.session.add(Investment(
+            operation="Compra", category="Renda variável", subcategory="FII",
+            asset="RZAG11", quantity=10, unit_value=Decimal("9.50"),
+            operation_date=date(2026, 8, 20),
+        ))
+        db.session.commit()
+
+    response = client.post("/investimentos/brapi", data={"token": "token-seguro"}, follow_redirects=True)
+    assert response.status_code == 200
+    assert "Brapi conectada" in response.text
+    assert "R$ 87,30" in response.text
+    assert "1.25% hoje" in response.text
+    with app.app_context():
+        setting = IntegrationSetting.query.filter_by(key="brapi_token").one()
+        assert setting.encrypted_value != "token-seguro"
+        assert decrypt_secret(setting.encrypted_value) == "token-seguro"
+        price = AssetPrice.query.filter_by(asset="RZAG11").one()
+        assert price.current_price == Decimal("8.73")
+        assert price.source == "brapi"
+
+    call_count = len(calls)
+    response = client.get("/investimentos")
+    assert response.status_code == 200
+    assert len(calls) == call_count
+
+
+def test_brapi_manual_refresh_ignores_cache(client, app, monkeypatch):
+    login(client)
+    calls = []
+
+    def fake_quote(asset, token):
+        calls.append(asset)
+        return {"asset": asset, "name": asset, "price": Decimal("10.25"), "change_percent": None}
+
+    monkeypatch.setattr("app.routes.fetch_brapi_quote", fake_quote)
+    with app.app_context():
+        from app.services.secret_store import encrypt_secret
+        db.session.add_all([
+            Investment(operation="Compra", category="Renda variável", asset="BOVA11", quantity=2, unit_value=Decimal("10.00"), operation_date=date.today()),
+            IntegrationSetting(key="brapi_token", encrypted_value=encrypt_secret("token")),
+            AssetPrice(asset="BOVA11", current_price=Decimal("10.00"), last_attempt_at=datetime.utcnow(), source="brapi"),
+        ])
+        db.session.commit()
+
+    response = client.post("/investimentos/cotacoes/atualizar", follow_redirects=True)
+    assert response.status_code == 200
+    assert "1 cotação(ões) atualizada(s) pela Brapi" in response.text
+    assert calls == ["BOVA11"]
