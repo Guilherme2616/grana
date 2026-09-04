@@ -960,7 +960,7 @@ def test_dashboard_counts_invoice_in_payment_month_without_duplicating_competenc
             invoice_id=invoice.id, purchase_date=date(2026, 8, 15),
             description="COMPRA DE AGOSTO", amount=Decimal("80.00"),
             selected=True, category_id=category.id,
-            payment_responsibility="self", personal_amount=Decimal("80.00"),
+            payment_responsibility="split", personal_amount=Decimal("30.00"),
         )
         db.session.add(item); db.session.flush()
         db.session.add(Transaction(
@@ -968,13 +968,14 @@ def test_dashboard_counts_invoice_in_payment_month_without_duplicating_competenc
             transaction_date=item.purchase_date, card_id=card.id,
             category_id=category.id, invoice_item_id=item.id,
             competence_month="2026-08", source="invoice",
-            payment_responsibility="self", personal_amount=Decimal("80.00"),
+            payment_responsibility="split", personal_amount=Decimal("30.00"),
         ))
         db.session.commit()
 
     september = client.get("/?month=2026-09")
     august = client.get("/?month=2026-08")
     assert "Saídas · Setembro/2026</span><strong>R$ 80,00" in september.text
+    assert "Comprometido nos cartões: R$ 80,00" in september.text
     assert "Saídas · Agosto/2026</span><strong>R$ 0,00" in august.text
 
 
