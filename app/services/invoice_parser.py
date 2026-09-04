@@ -755,12 +755,12 @@ def _normalize_bb_ocr_text(recognized):
         return f"{match.group('prefix')}{normalized_date}"
 
     recognized = re.sub(
-        r"(?m)^(?P<prefix>\\s*)(?P<date>[0-9gGoO]{2}/[0-9gGoO]{2})(?=\\s|$)",
+        r"(?m)^(?P<prefix>\s*)(?P<date>[0-9gGoO]{2}/[0-9gGoO]{2})(?=\s|$)",
         normalize_date,
         recognized,
     )
-    recognized = re.sub(r"\\bR[SG§g]\\s*(?=\\d)", "R$ ", recognized, flags=re.IGNORECASE)
-    return re.sub(r"(?<=\\d)\\.(?=\\d{2}(?:\\D|$))", ",", recognized)
+    recognized = re.sub(r"\bR[SG§g]\s*(?=\d)", "R$ ", recognized, flags=re.IGNORECASE)
+    return re.sub(r"(?<=\d)\.(?=\d{2}(?:\D|$))", ",", recognized)
 
 
 def ocr_pdf_pages(reader):
