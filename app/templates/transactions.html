@@ -26,6 +26,12 @@
 {% for item in transactions %}<tr><td>{{ item.transaction_date.strftime('%d/%m/%Y') }}</td><td>{{ item.competence_month or item.transaction_date.strftime('%Y-%m') }}</td><td><strong>{{ item.description }}</strong><small class="table-subtitle">{{ item.source }}{% if item.status=='planned' %} · previsto{% endif %}</small></td><td>{{ item.category.full_name if item.category else ('Dividido' if item.splits else '—') }}</td><td>{{ item.card.name if item.card else item.account.name if item.account else '—' }}</td><td>{{ 'Meus pais' if item.payment_responsibility == 'parents' else 'Dividido' if item.payment_responsibility == 'shared' else 'Eu' }}{% if item.payment_responsibility == 'shared' %}<small class="table-subtitle">Minha parte: {{ (item.personal_amount if item.personal_amount is not none else item.amount)|brl }}</small>{% endif %}</td><td class="money {{ item.kind }}-value">{{ '+' if item.kind=='income' else '-' }} {{ item.amount|brl }}</td><td><div class="row-actions"><a href="{{ url_for('main.edit_transaction',item_id=item.id) }}">Editar</a><a href="{{ url_for('main.split_transaction',item_id=item.id) }}">Dividir</a><form method="post" action="{{ url_for('main.delete_transaction',item_id=item.id) }}" onsubmit="return confirm('Excluir?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="danger-link">Excluir</button></form></div></td></tr>
 {% else %}<tr><td colspan="8" class="empty">Nenhum lançamento.</td></tr>{% endfor %}
 </tbody></table></div></section>
+<section class="indicator-metrics transaction-totals" aria-label="Totais dos lançamentos filtrados">
+  <article><span>Lançamentos encontrados</span><strong>{{ transactions|length }}</strong><small>Resultado dos filtros ativos</small></article>
+  <article><span>Entradas</span><strong class="positive">{{ total_income|brl }}</strong><small>Inclui estornos e reembolsos</small></article>
+  <article><span>Saídas</span><strong class="negative">{{ total_expenses|brl }}</strong><small>Soma integral dos gastos exibidos</small></article>
+  <article><span>Saldo líquido</span><strong class="{{ 'positive' if total_net >= 0 else 'negative' }}">{{ total_net|brl }}</strong><small>Entradas menos saídas</small></article>
+</section>
 <script>
 (()=>{const select=document.getElementById('payment-responsibility'),field=document.getElementById('personal-amount-field');const sync=()=>field.hidden=select.value!=='shared';select.addEventListener('change',sync);sync()})();
 </script>
