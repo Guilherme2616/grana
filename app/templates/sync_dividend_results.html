@@ -1,0 +1,6 @@
+{% extends 'base.html' %}
+{% block title %}Sincronização de proventos · Grana{% endblock %}
+{% block content %}
+<header class="page-head"><div><span class="eyebrow">GOOGLE DRIVE</span><h1>Extratos de proventos</h1><p>Resultado da pasta 00 - Proventos. Confirme cada arquivo novo antes de lançá-lo.</p></div><div class="page-actions"><a class="secondary-button" href="{{ url_for('main.dividends') }}">← Proventos</a></div></header>
+<section class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>Arquivo</th><th>Situação</th><th>Detalhes</th><th></th></tr></thead><tbody>{% for result in results %}<tr><td><strong>{{ result.filename }}</strong></td><td><span class="sync-status {{ result.tone }}">{{ result.status }}</span></td><td>{{ result.detail }}</td><td>{% if result.import_id %}<a class="table-action" href="{{ url_for('main.review_dividend_import', import_id=result.import_id) }}">Revisar →</a>{% else %}—{% endif %}</td></tr>{% endfor %}</tbody></table></div></section>
+{% endblock %}

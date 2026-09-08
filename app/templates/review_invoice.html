@@ -23,7 +23,8 @@
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="date_source" value="{{ suggestion.source }}">
   <section class="panel cycle-review">
-    <div><span class="eyebrow">DATAS DESTA FATURA</span><h2>Fechamento e vencimento</h2><p>{% if suggestion.source == 'pdf' %}Encontramos o vencimento no PDF. Confira antes de salvar.{% else %}O PDF não informou o vencimento; usamos o padrão do cartão.{% endif %}</p></div>
+    <div><span class="eyebrow">DADOS DESTA FATURA</span><h2>Total, fechamento e vencimento</h2><p>Confira o total lido no PDF. A diferença para as compras reconhecidas continuará visível na central de faturas.</p></div>
+    <label>Valor total<input name="official_total" inputmode="decimal" value="{{ '%.2f'|format(invoice.total)|replace('.', ',') }}" required></label>
     <label>Data de fechamento<input type="date" name="closing_date" value="{{ suggestion.closing_date }}" required></label>
     <label>Data de vencimento <span class="source-chip">{{ 'Encontrada no PDF' if suggestion.source == 'pdf' else 'Padrão do cartão' }}</span><input type="date" name="due_date" value="{{ suggestion.due_date }}" required></label>
   </section>

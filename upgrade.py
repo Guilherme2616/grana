@@ -55,6 +55,12 @@ with app.app_context():
             "fees": "ALTER TABLE investment ADD COLUMN fees NUMERIC(12, 2) DEFAULT 0 NOT NULL",
             "benchmark": "ALTER TABLE investment ADD COLUMN benchmark VARCHAR(20) DEFAULT 'CDI' NOT NULL",
         },
+        "asset_price": {
+            "asset_name": "ALTER TABLE asset_price ADD COLUMN asset_name VARCHAR(120) DEFAULT '' NOT NULL",
+            "change_percent": "ALTER TABLE asset_price ADD COLUMN change_percent NUMERIC(10, 4)",
+            "source": "ALTER TABLE asset_price ADD COLUMN source VARCHAR(30) DEFAULT 'manual' NOT NULL",
+            "last_attempt_at": "ALTER TABLE asset_price ADD COLUMN last_attempt_at DATETIME",
+        },
     }
     for table_name, columns in migrations.items():
         existing = {column["name"] for column in inspector.get_columns(table_name)}
@@ -73,6 +79,17 @@ with app.app_context():
     ))
     db.session.commit()
     db.session.execute(text("UPDATE credit_card SET institution = CASE invoice_provider WHEN 'bb_smiles' THEN 'Banco do Brasil' WHEN 'mercado_pago' THEN 'Mercado Pago' WHEN 'banco_inter' THEN 'Banco Inter' WHEN 'itau' THEN 'Itaú' ELSE institution END WHERE institution IS NULL OR institution = ''"))
+    db.session.commit()
+    # Compras importadas pertencem ao mês em que foram consumidas. A fatura
+    # com vencimento em setembro, por exemplo, representa gastos de agosto.
+    # A expressão é idempotente: sempre deriva a competência da fatura.
+    db.session.execute(text(
+        "UPDATE \"transaction\" SET competence_month = ("
+        "SELECT strftime('%Y-%m', invoice.reference_month || '-01', '-1 month') "
+        "FROM invoice_item JOIN invoice ON invoice.id = invoice_item.invoice_id "
+        "WHERE invoice_item.id = \"transaction\".invoice_item_id"
+        ") WHERE invoice_item_id IS NOT NULL"
+    ))
     db.session.commit()
     investment_category = Category.query.filter(
         db.func.lower(Category.name).in_(["investimento", "investimentos"])

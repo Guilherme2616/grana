@@ -1,1 +1,17 @@
-{% extends 'base.html' %}{% block title %}Calendário · Grana{% endblock %}{% block content %}<header class="page-head"><div><span class="eyebrow">AGENDA FINANCEIRA</span><h1>{{ month_name }}</h1><p>Realizados, previstos e vencimentos em ordem cronológica.</p></div><form method="get" class="period-picker"><label>Mês<input type="month" name="month" value="{{ reference_month }}"></label><button class="secondary-button">Atualizar</button></form></header><section class="panel timeline-list">{% for event in events %}<article><time>{{ event.date.strftime('%d') }}<small>{{ event.date.strftime('%b') }}</small></time><i class="{{ event.tone }}"></i><div><strong>{{ event.title }}</strong><span>{{ event.detail }}</span></div><b>{{ event.amount|brl if event.amount is not none else '—' }}</b></article>{% else %}<p class="empty">Nenhum evento neste mês.</p>{% endfor %}</section>{% endblock %}
+{% extends 'base.html' %}{% block title %}Calendário · Grana{% endblock %}{% block content %}
+<header class="page-head calendar-head"><div><span class="eyebrow">AGENDA FINANCEIRA</span><h1>{{ month_name }}</h1><p>Veja em quais dias o dinheiro entra, sai ou uma fatura vence.</p></div><div class="calendar-navigation"><a class="secondary-button" href="{{ url_for('main.financial_calendar', month=previous_month) }}">←</a><form method="get" class="period-picker"><label>Mês<input type="month" name="month" value="{{ reference_month }}"></label><button class="secondary-button">Ir</button></form><a class="secondary-button" href="{{ url_for('main.financial_calendar', month=next_month) }}">→</a></div></header>
+
+<section class="calendar-summary">
+  <article><span>Entradas realizadas</span><strong class="positive-dark">{{ realized_income|brl }}</strong></article>
+  <article><span>Saídas realizadas</span><strong>{{ realized_expenses|brl }}</strong></article>
+  <article><span>Valores previstos</span><strong>{{ planned|brl }}</strong></article>
+  <div class="calendar-legend"><span><i class="income"></i> Entrada</span><span><i class="expense"></i> Saída</span><span><i class="card"></i> Vencimento</span></div>
+</section>
+
+<section class="panel calendar-panel">
+  <div class="calendar-weekdays">{% for label in ['Seg','Ter','Qua','Qui','Sex','Sáb','Dom'] %}<span>{{ label }}</span>{% endfor %}</div>
+  <div class="calendar-grid">{% for week in weeks %}{% for cell in week %}{% if cell %}<article class="calendar-day {{ 'today' if reference_month == today.strftime('%Y-%m') and cell.day == today.day }}"><header><strong>{{ cell.day }}</strong>{% if cell.events %}<small>{{ cell.events|length }} {{ 'evento' if cell.events|length == 1 else 'eventos' }}</small>{% endif %}</header><div>{% for event in cell.events[:3] %}<span class="calendar-event {{ event.tone }}" title="{{ event.title }} · {{ event.detail }}"><i></i><b>{{ event.title }}</b>{% if event.amount is not none %}<small>{{ event.amount|brl }}</small>{% endif %}</span>{% endfor %}{% if cell.events|length > 3 %}<em>+ {{ cell.events|length - 3 }} outros</em>{% endif %}</div></article>{% else %}<div class="calendar-day outside"></div>{% endif %}{% endfor %}{% endfor %}</div>
+</section>
+
+<details class="panel calendar-agenda"><summary>Ver agenda detalhada ({{ events|length }} eventos)</summary><div class="timeline-list">{% for event in events %}<article><time>{{ event.date.strftime('%d') }}<small>{{ event.date.strftime('%b') }}</small></time><i class="{{ event.tone }}"></i><div><strong>{{ event.title }}</strong><span>{{ event.detail }}</span></div><b>{{ event.amount|brl if event.amount is not none else '—' }}</b></article>{% else %}<p class="empty">Nenhum evento neste mês.</p>{% endfor %}</div></details>
+{% endblock %}

@@ -121,6 +121,22 @@ def list_month_pdfs(reference_month):
     return session, pdfs
 
 
+def list_dividend_pdfs():
+    root_id = current_app.config.get("GOOGLE_DRIVE_ROOT_FOLDER_ID", "")
+    if not root_id:
+        raise DriveConfigurationError("A pasta principal do Google Drive não foi configurada.")
+
+    session = _authorized_session()
+    dividend_folder = _find_folder(
+        session,
+        root_id,
+        lambda name: any(part.startswith("PROVENTO") for part in normalize_folder_name(name).split()),
+        "Não encontrei a pasta de Proventos dentro de Faturas Grana.",
+    )
+    pdfs = _list_children(session, dividend_folder["id"], "application/pdf")
+    return session, pdfs
+
+
 def download_pdf(session, file_id):
     response = session.get(f"{DRIVE_API}/files/{file_id}", params={"alt": "media"}, timeout=60)
     if not response.ok:
