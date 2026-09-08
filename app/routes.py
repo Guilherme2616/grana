@@ -865,7 +865,33 @@ def transactions():
     raw_items = query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).all()
     filters = transaction_filters()
     items = filter_transactions(raw_items, filters)
-    return render_template("transactions.html", transactions=items, accounts=Account.query.filter_by(active=True).all(), categories=category_options(), cards=CreditCard.query.filter_by(active=True).all(), institutions=[row[0] for row in db.session.query(CreditCard.institution).filter(CreditCard.institution != "").distinct().all()], today=date.today(), filters={**filters, "start":start, "end":end})
+    total_income = sum(
+        (money(item.amount) for item in items if item.kind in {"income", "refund"}),
+        Decimal("0"),
+    )
+    total_expenses = sum(
+        (money(item.amount) for item in items if item.kind == "expense"),
+        Decimal("0"),
+    )
+    return render_template(
+        "transactions.html",
+        transactions=items,
+        accounts=Account.query.filter_by(active=True).all(),
+        categories=category_options(),
+        cards=CreditCard.query.filter_by(active=True).all(),
+        institutions=[
+            row[0]
+            for row in db.session.query(CreditCard.institution)
+            .filter(CreditCard.institution != "")
+            .distinct()
+            .all()
+        ],
+        today=date.today(),
+        filters={**filters, "start": start, "end": end},
+        total_income=total_income,
+        total_expenses=total_expenses,
+        total_net=total_income - total_expenses,
+    )
 
 
 @main.route("/movimentacoes/<int:item_id>/editar", methods=["GET", "POST"])
