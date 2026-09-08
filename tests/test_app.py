@@ -1131,3 +1131,65 @@ def test_brapi_manual_refresh_ignores_cache(client, app, monkeypatch):
     assert response.status_code == 200
     assert "1 cotação(ões) atualizada(s) pela Brapi" in response.text
     assert calls == ["BOVA11"]
+
+def test_transaction_totals_follow_bank_search_date_and_type_filters(client, app):
+    login(client)
+    with app.app_context():
+        card = CreditCard.query.first()
+        card.institution = "Banco do Brasil"
+        account = Account.query.first()
+        db.session.add_all([
+            Transaction(
+                description="ANUIDADE BB",
+                amount=Decimal("48.00"),
+                kind="expense",
+                transaction_date=date(2026, 8, 28),
+                competence_month="2026-08",
+                card_id=card.id,
+            ),
+            Transaction(
+                description="COMPRA BB",
+                amount=Decimal("277.05"),
+                kind="expense",
+                transaction_date=date(2026, 8, 15),
+                competence_month="2026-08",
+                card_id=card.id,
+            ),
+            Transaction(
+                description="COMPRA OUTRO BANCO",
+                amount=Decimal("90.00"),
+                kind="expense",
+                transaction_date=date(2026, 8, 15),
+                competence_month="2026-08",
+            ),
+            Transaction(
+                description="SALÁRIO",
+                amount=Decimal("1000.00"),
+                kind="income",
+                transaction_date=date(2026, 8, 5),
+                competence_month="2026-08",
+                account_id=account.id,
+            ),
+        ])
+        db.session.commit()
+
+    bank = client.get("/movimentacoes?institution=Banco+do+Brasil")
+    assert bank.status_code == 200
+    assert "Lançamentos encontrados</span><strong>2" in bank.text
+    assert 'Entradas</span><strong class="positive">R$ 0,00' in bank.text
+    assert 'Saídas</span><strong class="negative">R$ 325,05' in bank.text
+    assert "R$ -325,05" in bank.text
+    assert "COMPRA OUTRO BANCO" not in bank.text
+
+    search_and_date = client.get(
+        "/movimentacoes?institution=Banco+do+Brasil&q=ANUIDADE"
+        "&start=2026-08-20&end=2026-08-31"
+    )
+    assert "Lançamentos encontrados</span><strong>1" in search_and_date.text
+    assert 'Saídas</span><strong class="negative">R$ 48,00' in search_and_date.text
+
+    income = client.get("/movimentacoes?kind=income")
+    assert "Lançamentos encontrados</span><strong>1" in income.text
+    assert 'Entradas</span><strong class="positive">R$ 1.000,00' in income.text
+    assert 'Saídas</span><strong class="negative">R$ 0,00' in income.text
+
