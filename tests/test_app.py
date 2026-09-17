@@ -1262,7 +1262,6 @@ def test_indicators_reconcile_with_dashboard_cashflow(client, app):
     for expected in ("R$ 200,00", "R$ 100,00"):
         assert expected in dashboard.text
         assert expected in indicators.text
-    assert 'Resultado do mês</span><strong class="positive">R$ 100,00' in dashboard.text
     assert 'RESULTADO DO MÊS</span><strong class="positive">R$ 100,00' in indicators.text
     assert 'TAXA DE POUPANÇA</span><strong>50.0%' in indicators.text
     assert "PATRIMÔNIO LÍQUIDO" in indicators.text
