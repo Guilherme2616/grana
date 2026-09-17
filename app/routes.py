@@ -691,15 +691,14 @@ def indicators():
         start, end = month_bounds(reference_month)
 
     previous_month = shift_month(reference_month, -1)
-    previous_start, previous_end = month_bounds(previous_month)
     filters = transaction_filters()
     all_transactions = Transaction.query.all()
-    month_items = filter_transactions([item for item in all_transactions if (item.competence_month or item.transaction_date.strftime("%Y-%m")) == reference_month], filters)
-    previous_items = filter_transactions([item for item in all_transactions if (item.competence_month or item.transaction_date.strftime("%Y-%m")) == previous_month], filters)
-    income = sum((Decimal(item.amount) for item in month_items if item.kind == "income"), Decimal("0"))
-    expenses = sum((personal_value(item) for item in month_items if item.kind == "expense"), Decimal("0")) - sum((personal_value(item) for item in month_items if item.kind == "refund"), Decimal("0"))
-    previous_income = sum((Decimal(item.amount) for item in previous_items if item.kind == "income"), Decimal("0"))
-    previous_expenses = sum((personal_value(item) for item in previous_items if item.kind == "expense"), Decimal("0")) - sum((personal_value(item) for item in previous_items if item.kind == "refund"), Decimal("0"))
+    filtered_transactions = filter_transactions(all_transactions, filters)
+    month_items, income, expenses = monthly_totals(filtered_transactions, reference_month)
+    previous_items, previous_income, previous_expenses = monthly_totals(
+        filtered_transactions,
+        previous_month,
+    )
     net = income - expenses
     savings_rate = (net / income * Decimal("100")).quantize(Decimal("0.1")) if income else None
 
@@ -707,35 +706,50 @@ def indicators():
     card_data = {}
     origin_data = {"Cartões": Decimal("0"), "Contas e outros": Decimal("0")}
     daily_data = {day: Decimal("0") for day in range(1, end.day + 1)}
+    invoice_cash_dates = {}
+    for invoice in Invoice.query.filter_by(status="confirmed", reference_month=reference_month).all():
+        cash_date = invoice.suggested_due_date
+        if not cash_date or cash_date.strftime("%Y-%m") != reference_month:
+            due_day = max(1, min(int(invoice.card.due_day or end.day), end.day))
+            cash_date = date(start.year, start.month, due_day)
+        for invoice_item in invoice.items:
+            if invoice_item.selected:
+                invoice_cash_dates[invoice_item.id] = cash_date
+
     expense_items = [item for item in month_items if item.kind == "expense"]
-    for item in expense_items:
-        ratio = personal_value(item) / money(item.amount) if money(item.amount) else Decimal("0")
-        allocations = [(split.category, money(split.amount) * ratio) for split in item.splits] or [(item.category, personal_value(item))]
+    spending_items = [item for item in month_items if item.kind in {"expense", "refund"}]
+    for item in spending_items:
+        direction = Decimal("-1") if item.kind == "refund" else Decimal("1")
+        allocations = [
+            (split.category, money(split.amount) * direction)
+            for split in item.splits
+        ] or [(item.category, money(item.amount) * direction)]
         for category, allocated_amount in allocations:
             category_name = category.full_name if category else "Sem categoria"
             category_color = category.color if category else "#8E8D8A"
             category_data.setdefault(category_name, {"amount": Decimal("0"), "color": category_color})
             category_data[category_name]["amount"] += allocated_amount
+        signed_amount = money(item.amount) * direction
         if item.card:
             card_data.setdefault(item.card.name, {"amount": Decimal("0"), "color": item.card.color})
-            card_data[item.card.name]["amount"] += personal_value(item)
-            origin_data["Cartões"] += personal_value(item)
+            card_data[item.card.name]["amount"] += signed_amount
+            origin_data["Cartões"] += signed_amount
         else:
-            origin_data["Contas e outros"] += personal_value(item)
-        if item.transaction_date.month == start.month:
-            daily_data[item.transaction_date.day] += personal_value(item)
+            origin_data["Contas e outros"] += signed_amount
+        cash_date = invoice_cash_dates.get(item.invoice_item_id, item.transaction_date)
+        if start <= cash_date <= end:
+            daily_data[cash_date.day] += signed_amount
 
     categories = sorted(({"name": name, **values} for name, values in category_data.items()), key=lambda row: row["amount"], reverse=True)
     cards = sorted(({"name": name, **values} for name, values in card_data.items()), key=lambda row: row["amount"], reverse=True)
     trend = []
     for offset in range(-5, 1):
         month = shift_month(reference_month, offset)
-        trend_start, trend_end = month_bounds(month)
-        rows = filter_transactions([item for item in all_transactions if (item.competence_month or item.transaction_date.strftime("%Y-%m")) == month], filters)
+        _, month_income, month_expenses = monthly_totals(filtered_transactions, month)
         trend.append({
             "label": month_label(month, short=True),
-            "income": float(sum((Decimal(row.amount) for row in rows if row.kind == "income"), Decimal("0"))),
-            "expenses": float(sum((personal_value(row) for row in rows if row.kind == "expense"), Decimal("0")) - sum((personal_value(row) for row in rows if row.kind == "refund"), Decimal("0"))),
+            "income": float(month_income),
+            "expenses": float(month_expenses),
         })
 
     elapsed_days = end.day
@@ -745,7 +759,9 @@ def indicators():
     projected_month = average_daily * end.day if reference_month == date.today().strftime("%Y-%m") else expenses
     invested = investment_position()
     cash = cash_balance()
-    patrimony = cash + invested
+    card_commitment = outstanding_card_commitment()
+    available_balance = cash - card_commitment
+    patrimony = available_balance + invested
     future_rows = future_invoice_rows(reference_month, 12)
     future_total = sum((row["total"] for row in future_rows), Decimal("0"))
 
@@ -781,7 +797,8 @@ def indicators():
         "indicators.html", reference_month=reference_month, month_name=month_label(reference_month),
         income=income, expenses=expenses, net=net, savings_rate=savings_rate,
         income_change=percentage_change(income, previous_income), expense_change=percentage_change(expenses, previous_expenses),
-        average_daily=average_daily, projected_month=projected_month, cash=cash, invested=invested,
+        average_daily=average_daily, projected_month=projected_month, cash=cash,
+        available_balance=available_balance, card_commitment=card_commitment, invested=invested,
         patrimony=patrimony, future_total=future_total, categories=categories, cards=cards,
         top_expenses=sorted(expense_items, key=lambda item: item.amount, reverse=True)[:8],
         guidance=guidance, chart_data=chart_data, filters=filters,
