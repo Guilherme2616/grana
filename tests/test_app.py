@@ -1193,3 +1193,80 @@ def test_transaction_totals_follow_bank_search_date_and_type_filters(client, app
     assert 'Entradas</span><strong class="positive">R$ 1.000,00' in income.text
     assert 'Saídas</span><strong class="negative">R$ 0,00' in income.text
 
+def test_indicators_reconcile_with_dashboard_cashflow(client, app):
+    login(client)
+    with app.app_context():
+        account = Account.query.first()
+        card = CreditCard.query.first()
+        category = Category.query.first()
+        invoice = Invoice(
+            card_id=card.id,
+            reference_month="2026-09",
+            total=Decimal("80.00"),
+            status="confirmed",
+            suggested_due_date=date(2026, 9, 10),
+        )
+        db.session.add(invoice)
+        db.session.flush()
+        invoice_item = InvoiceItem(
+            invoice_id=invoice.id,
+            purchase_date=date(2026, 8, 15),
+            description="COMPRA DE AGOSTO",
+            amount=Decimal("80.00"),
+            selected=True,
+            category_id=category.id,
+            payment_responsibility="split",
+            personal_amount=Decimal("30.00"),
+        )
+        db.session.add(invoice_item)
+        db.session.flush()
+        db.session.add_all([
+            Transaction(
+                description="COMPRA DE AGOSTO",
+                amount=Decimal("80.00"),
+                kind="expense",
+                transaction_date=date(2026, 8, 15),
+                card_id=card.id,
+                category_id=category.id,
+                invoice_item_id=invoice_item.id,
+                competence_month="2026-08",
+                source="invoice",
+                payment_responsibility="split",
+                personal_amount=Decimal("30.00"),
+            ),
+            Transaction(
+                description="CONTA DE SETEMBRO",
+                amount=Decimal("20.00"),
+                kind="expense",
+                transaction_date=date(2026, 9, 12),
+                account_id=account.id,
+                category_id=category.id,
+                competence_month="2026-09",
+            ),
+            Transaction(
+                description="SALÁRIO",
+                amount=Decimal("200.00"),
+                kind="income",
+                transaction_date=date(2026, 9, 5),
+                account_id=account.id,
+                competence_month="2026-09",
+            ),
+        ])
+        db.session.commit()
+
+    dashboard = client.get("/?month=2026-09")
+    indicators = client.get("/indicadores?month=2026-09")
+
+    assert dashboard.status_code == 200
+    assert indicators.status_code == 200
+    for expected in ("R$ 200,00", "R$ 100,00"):
+        assert expected in dashboard.text
+        assert expected in indicators.text
+    assert "Resultado do mês</span><strong>R$ 100,00" in dashboard.text
+    assert 'RESULTADO DO MÊS</span><strong class="positive">R$ 100,00' in indicators.text
+    assert 'TAXA DE POUPANÇA</span><strong>50.0%' in indicators.text
+    assert "PATRIMÔNIO LÍQUIDO" in indicators.text
+    assert "Disponível R$ 200,00 + investimentos R$ 0,00" in indicators.text
+    assert '"expenses": 100.0' in indicators.text
+    assert '"income": 200.0' in indicators.text
+
