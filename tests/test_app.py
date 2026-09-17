@@ -893,7 +893,7 @@ def test_financial_indicators_provisioning_and_simulator_pages(client, app):
     indicators = client.get("/indicadores?month=2026-08")
     assert indicators.status_code == 200
     assert "Indicadores financeiros" in indicators.text
-    assert "PATRIMÔNIO TOTAL" in indicators.text
+    assert "PATRIMÔNIO LÍQUIDO" in indicators.text
     future = client.get("/proximas-faturas?month=2026-08")
     assert future.status_code == 200
     assert "Próximas faturas" in future.text
