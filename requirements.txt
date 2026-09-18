@@ -6,3 +6,5 @@ pypdf>=5,<7
 cryptography>=41,<47
 google-auth>=2.30,<3
 requests>=2.31,<3
+Pillow>=10,<12
+pytesseract>=0.3.10,<1
